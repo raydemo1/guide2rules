@@ -1,0 +1,15 @@
+{
+  "金融": "finance",
+  "气象": "meteorology",
+  "政务": "government",
+  "政府": "government",
+  "科学": "science",
+  "科研": "science",
+  "医疗": "healthcare",
+  "医疗卫生": "healthcare",
+  "教育": "education",
+  "交通": "transportation",
+  "能源": "energy",
+  "环境": "environment",
+  "农业": "agriculture"
+}

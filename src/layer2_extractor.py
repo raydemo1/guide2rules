@@ -6,43 +6,83 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from llm_client import chat
 from prompt_examples import get_layer2_examples
 
-# 关键词常量（需在函数调用前定义）
-GENERIC_KEYWORDS = [
-    "身份证",
-    "居民身份证",
-    "统一社会信用代码",
-    "手机号",
-    "电话",
-    "联系电话",
-    "邮箱",
-    "电子邮箱",
-    "地址",
-    "住址",
-    "家庭关系",
-    "营业收入",
-    "岗位",
-    "职称",
-    "注册日期",
-    "账户",
-    "交易",
-    "流水",
-    "IP",
-    "URL",
-    "网址",
-    "车牌",
-    "司机",
-    "线路",
-    "单位",
-    "联系人",
-]
 
-DOMAIN_EXTRA = {
-    "finance": ["账户", "交易", "流水", "银行卡", "授信", "客户"],
-    "meteorology": ["站号", "气象", "温度", "降水", "风速"],
-    "government": ["居民", "户籍", "社保", "医保", "税号"],
-    "traffic": ["车牌", "司机", "线路", "路段", "里程", "站点"],
-    "science": [],
-}
+def _load_keywords_config():
+    override = os.environ.get("L2_KEYWORDS_CONFIG") or ""
+    root = os.path.dirname(os.path.dirname(__file__))
+    cfg_path = (
+        override if override else os.path.join(root, "config", "layer2_keywords.json")
+    )
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+            return cfg.get("generic", []) or [], cfg.get("domain_extra", {}) or {}
+    except Exception:
+        return [
+            "身份证",
+            "居民身份证",
+            "统一社会信用代码",
+            "手机号",
+            "电话",
+            "联系电话",
+            "邮箱",
+            "电子邮箱",
+            "地址",
+            "住址",
+            "家庭关系",
+            "营业收入",
+            "岗位",
+            "职称",
+            "注册日期",
+            "账户",
+            "交易",
+            "流水",
+            "IP",
+            "URL",
+            "网址",
+            "车牌",
+            "司机",
+            "线路",
+            "单位",
+            "联系人",
+        ], {
+            "finance": ["账户", "交易", "流水", "银行卡", "授信", "客户"],
+            "meteorology": ["站号", "气象", "温度", "降水", "风速"],
+            "government": ["居民", "户籍", "社保", "医保", "税号"],
+            "transportation": ["车牌", "司机", "线路", "路段", "里程", "站点"],
+            "science": [],
+        }
+
+
+GENERIC_KEYWORDS, DOMAIN_EXTRA = _load_keywords_config()
+
+
+def _load_params_config():
+    override = os.environ.get("L2_PARAMS_CONFIG") or ""
+    root = os.path.dirname(os.path.dirname(__file__))
+    cfg_path = (
+        override if override else os.path.join(root, "config", "layer2_params.json")
+    )
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+            return {
+                "workers": int(cfg.get("workers", 5)),
+                "batch_size": int(cfg.get("batch_size", 20)),
+                "per_path_frag_limit": int(cfg.get("per_path_frag_limit", 3)),
+                "group_frag_limit": int(cfg.get("group_frag_limit", 12)),
+            }
+    except Exception:
+        return {
+            "workers": int(os.environ.get("L2_WORKERS", "5") or "5"),
+            "batch_size": int(os.environ.get("L2_BATCH_SIZE", "20") or "20"),
+            "per_path_frag_limit": int(
+                os.environ.get("L2_PER_PATH_FRAG_LIMIT", "3") or "3"
+            ),
+            "group_frag_limit": int(
+                os.environ.get("L2_GROUP_FRAG_LIMIT", "12") or "12"
+            ),
+        }
 
 
 def group_paths(
@@ -99,12 +139,13 @@ def extract_structured(
 
     if use_paths:
         system = (
-            "你是数据分类分级抽取器Agent。根据给定的四级路径(paths)与相关片段，"
-            "把每个路径下的最小数据项进行枚举与分级。"
+            "你是数据分类分级抽取器Agent。根据给定的分类分级体系与相关片段，"
+            "把每个路径下的最小数据项进行枚举与分级，并为每个item生成匹配信息。"
             "说明：item 指可在字段/口径上落地的最小数据单元，例如 '身份证号'、'手机号'、'URL'、'IP'、'电子邮箱(员工)' 等；"
             "每个 level4 只需提供一次 citation 作为该路径的证据，items 不需要单独 citation。"
+            "匹配信息包含 patterns:{keywords:List, regex:List}。keywords 用于关键词匹配；regex 为正则表达式字符串。"
             "输出严格JSON: {domain, source, extraction}。extraction为列表，项结构:"
-            "{path:{level1,level2,level3,level4}, citation:{page,text}, items:[{name, level(S1~S4), conditions[], exceptions[]}]}。"
+            "{path:{level1,level2,level3,level4}, citation:{page,text}, items:[{name, level(S1~S4), conditions[], exceptions[], patterns:{keywords[], regex[]}}]}。"
             "若无法在片段中找到明确证据，请仍返回该路径并设置 citation.text 为最接近的依据，同时将不确定的 item 标注 exceptions=['needs_review']。"
             "禁止输出非JSON。"
         )
@@ -112,7 +153,7 @@ def extract_structured(
         system = (
             "你是数据分类分级抽取器Agent。根据taxonomy-seeds与原始标准片段，"
             "输出严格JSON: {domain, source, extraction}。extraction包含List项，每项结构:"
-            "{category, level, conditions(List), exceptions(List?), citation({page,text})}."
+            "{category, level, conditions(List), exceptions(List?), citation({page,text}), patterns:{keywords[], regex[]}}."
             "禁止输出非JSON。"
         )
 
@@ -164,10 +205,11 @@ def run_for_artifact_dir(artifact_dir: str, base: str, domain: str):
     use_paths = bool(seeds.get("paths"))
     if use_paths:
         print(f"[DEBUG] 使用四级路径分组抽取")
-        batch_size = int(os.environ.get("L2_BATCH_SIZE", "20") or "20")
-        per_path_limit = int(os.environ.get("L2_PER_PATH_FRAG_LIMIT", "3") or "3")
-        group_limit = int(os.environ.get("L2_GROUP_FRAG_LIMIT", "12") or "12")
-        workers = int(os.environ.get("L2_WORKERS", "5") or "5")
+        params = _load_params_config()
+        batch_size = params["batch_size"]
+        per_path_limit = params["per_path_frag_limit"]
+        group_limit = params["group_frag_limit"]
+        workers = params["workers"]
         groups = group_paths(seeds.get("paths", []), ("level1", "level2"), batch_size)
         print(
             f"[DEBUG] 分成 {len(groups)} 组，每组最多 {batch_size} 条路径，并行度 {workers}"

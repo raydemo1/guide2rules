@@ -2,30 +2,11 @@ import json
 import os
 from typing import Dict, List
 
-from pdf_text import read_pdf_text
+from pdf_plumber_text import read_pdf_plumber_text
+from convert_to_pdf import convert_docx_to_pdf, convert_doc_to_pdf
 from llm_client import chat
 from prompt_examples import get_layer1_examples
-
-
-DOMAINS = {
-    "金融": "finance",
-    "气象": "meteorology",
-    "政务": "government",
-    "政府": "government",
-    "科学": "science",
-    "科研": "science",
-}
-
-
-def detect_domain(filename: str) -> str:
-    name = os.path.basename(filename)
-    print(f"[DEBUG] 检测文件名: {name}")
-    for k, v in DOMAINS.items():
-        if k in name:
-            print(f"[DEBUG] 匹配到域名: {k} -> {v}")
-            return v
-    print(f"[DEBUG] 未匹配到特定域名，使用默认: general")
-    return "general"
+from domains import detect_domain
 
 
 def join_pages(pages: List[str]) -> str:
@@ -39,15 +20,40 @@ def extract_taxonomy_and_glossary(text: str, source: str, domain: str) -> Dict:
     print(f"[DEBUG] 文本长度: {len(text)} 字符")
 
     system = (
-        "你是数据分类分级知识层Agent。请基于指南文本提炼领域的分类分级体系和术语表。"
-        "仅返回严格JSON，键包含: taxonomy, glossary。"
-        "taxonomy需包含四级分类骨架：{levels_definition, tree: List}，不包含items。"
-        "tree节点结构: {level1, children:[{level2, children:[{level3, children:[{level4}]}]}]}。"
-        "若原文为其他层级结构，请转换并补齐到四级（无法补齐用空字符串）。"
-        "glossary为List[{term, definition, synonyms?}]."
-        "禁止输出任何非JSON内容。"
-        "如果你的输出不是严格 JSON（例如语法错误、缺引号、多余文本），你必须自动立即修复，直到输出合法 JSON 为止。最终输出只能包含修正后的 JSON。"
+        "你是“数据分类分级知识层 Agent”。请基于指南文本提炼领域的分级体系（如有，级别格式统一为 S+数字，例如 S1、S2、S3…；"
+        "若某一级包含子级，则使用 Sx-1、Sx-2、Sx-3…；S1 始终代表最低级，数字越大重要性越高；"
+        "等级数量由指南文本真实出现的等级数量决定，不得自行增删）。"
+        "并提炼分类体系（如有）与术语表。"
+        "仅返回严格 JSON，键包含: taxonomy, glossary。"
+        "【taxonomy 要求】"
+        "taxonomy 顶层结构必须为：{levels_definition, tree}。"
+        "1. 在 levels_definition 中："
+        "若指南未提供分级体系，则 levels_definition 返回空数组。"
+        "若指南提供分级体系，必须严格按照原文出现顺序逐条提取等级。"
+        "若某个等级包含子等级（如“一般数据”下含“一般3级/2级/1级”），则编号为 Sx-1、Sx-2、Sx-3…（顺序依原文）。"
+        "每个等级项格式固定为："
+        "{code: 'Sx 或 Sx-y', description: '原文定义或空字符串', sublevels: [...] }。"
+        "若无子级则去掉sublevels 。"
+        "2. tree 表示分类体系（如存在）。"
+        "若指南未提供分类体系，则 tree 返回空数组。"
+        "若指南提供分类体系："
+        "—— 分类层级数量必须与指南文本实际结构一致。"
+        "—— 最大层级 = 文本中出现的最深层级。"
+        "—— 所有分类路径必须补齐至该最大层级，缺失层级用 name: '' 填补。"
+        "—— 每个分类节点格式为：{name: '分类名称或空', children: [...] }。"
+        "若指南文本中已经给出最小颗粒度字段（items，例如字段名、字段代码、具体数据项），"
+        "则允许在最底层增加 'items': ['item1', 'item2', ...] 字段，用于保留原始字段。"
+        "若指南未给出字段名，则不得创建 items。"
+        "tree 中除 items 外不得包含示例值或额外属性。"
+        "【glossary 要求】"
+        "glossary 为 List[{term, definition, synonyms}]。"
+        "所有术语必须来自原文；synonyms 若无同义词则必须返回空数组。"
+        "【输出要求】"
+        "禁止输出任何非 JSON 内容。"
+        "最终输出必须是严格合法 JSON。"
+        "若输出 JSON 不合法（语法错误、缺少引号、包含多余文本等），必须自动修复并重新输出，直到完全合法为止。"
     )
+
     user = "来源:" + source + "\n\n" + text
 
     print(f"[DEBUG] 发送请求到LLM...")
@@ -134,34 +140,46 @@ def main():
     guide_dir = os.path.join(root, "guide")
     print(f"[DEBUG] 指南文件目录: {guide_dir}")
 
-    files = [
-        os.path.join(guide_dir, f)
-        for f in os.listdir(guide_dir)
-        if f.lower().endswith(".pdf")
-    ]
+    files = []
+    for f in os.listdir(guide_dir):
+        fl = f.lower()
+        if fl.endswith(".pdf") or fl.endswith(".docx") or fl.endswith(".doc"):
+            files.append(os.path.join(guide_dir, f))
     if not files:
-        raise RuntimeError("guide 目录下未找到 PDF 指南文件")
+        raise RuntimeError("guide 目录下未找到指南文件")
 
-    print(
-        f"[DEBUG] 找到 {len(files)} 个PDF文件: {[os.path.basename(f) for f in files]}"
-    )
+    print(f"[DEBUG] 找到 {len(files)} 个 文件: {[os.path.basename(f) for f in files]}")
 
     for i, path in enumerate(files, 1):
         print(f"\n[DEBUG] 处理第 {i}/{len(files)} 个文件: {os.path.basename(path)}")
 
         domain = detect_domain(path)
-        print(f"[DEBUG] 读取PDF文件...")
-        pages = read_pdf_text(path)
-        print(f"[DEBUG] 读取到 {len(pages)} 页")
+        ext = os.path.splitext(path)[1].lower()
+        if ext == ".pdf":
+            print(f"[DEBUG] 读取PDF文件(通过pdfplumber)...")
+            frags = read_pdf_plumber_text(path)
+        elif ext == ".docx":
+            print(f"[DEBUG] 转换DOCX为PDF...")
+            pdf_path = convert_docx_to_pdf(path)
+            print(f"[DEBUG] 读取转换后的PDF(通过pdfplumber): {pdf_path}")
+            frags = read_pdf_plumber_text(pdf_path)
+        elif ext == ".doc":
+            print(f"[DEBUG] 转换DOC为PDF...")
+            pdf_path = convert_doc_to_pdf(path)
+            print(f"[DEBUG] 读取转换后的PDF(通过pdfplumber): {pdf_path}")
+            frags = read_pdf_plumber_text(pdf_path)
+        else:
+            raise RuntimeError(f"不支持的文件类型: {ext}")
+        print(f"[DEBUG] 读取到 {len(frags)} 段")
 
-        text = join_pages(pages)
+        text = join_pages([f["text"] for f in frags])
         print(f"[DEBUG] 合并后文本长度: {len(text)} 字符")
 
         obj = extract_taxonomy_and_glossary(text, path, domain)
         taxonomy = obj.get("taxonomy", {})
         glossary = obj.get("glossary", [])
         seeds = build_seeds(taxonomy)
-        fragments = build_fragments(pages)
+        fragments = frags
 
         print(f"[DEBUG] 构建了 {len(fragments)} 个文本片段")
 

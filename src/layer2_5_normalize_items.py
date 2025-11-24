@@ -55,7 +55,7 @@ def normalize_items(extraction: Dict, mapping: Dict[str, str]) -> Dict:
                     unchanged_count += 1
                 out.append({
                     'path': path,
-                    'item': {'name': name, 'canonical': canon},
+                    'item': {'name': name, 'canonical': canon, 'patterns': sub.get('patterns', {})},
                     'level': sub.get('level', ''),
                     'conditions': sub.get('conditions', []) or [],
                     'exceptions': sub.get('exceptions', []) or [],
@@ -70,6 +70,8 @@ def normalize_items(extraction: Dict, mapping: Dict[str, str]) -> Dict:
                 unchanged_count += 1
             it['item'] = it.get('item') or {}
             it['item']['canonical'] = canon
+            if 'patterns' not in it['item']:
+                it['item']['patterns'] = {}
             out.append(it)
 
     extraction['extraction'] = out

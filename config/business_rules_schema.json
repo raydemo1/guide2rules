@@ -1,0 +1,6 @@
+{
+  "include_patterns": true,
+  "stop_on_first_trigger": true,
+  "require_field_and_category": true
+}
+

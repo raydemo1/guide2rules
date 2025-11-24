@@ -1,13 +1,13 @@
 # guide2rules
 
-通过大模型（GLM）将“数据分类分级指南”自动转化为可执行的规则表（OpenRules），并生成可审计的证据与规范化的数据项。项目采用分层管线实现：先抽取领域分类骨架，再对每条细粒度路径批量枚举最小数据项，随后归一化并与人工/Excel 动态规则合并，最终产出可在运行时加载的决策表。
+通过大模型（GLM）将“数据分类分级指南”自动转化为可执行的业务规则（business-rules），并生成可审计的证据与规范化的数据项。项目采用分层管线实现：先抽取领域分类骨架，再对每条细粒度路径批量枚举最小数据项，随后归一化并与人工/Excel 动态规则合并，最终产出可在运行时加载的规则集。
 
 **核心目标**
 
 - 将不同领域的指南（PDF）结构化为统一的四级分类骨架与术语表。
 - 为每条 `level4` 路径抽取最小数据项及路径级证据，保证可追溯。
-- 归一化同义项与口径，合并静态抽取与动态规则，生成 OpenRules 决策表。
-- 为后续规则库运行时加载与 REST 接口集成打基础。
+- 归一化同义项与口径，合并静态抽取与动态规则，生成 business-rules 规则集并进行去重与冲突消解。
+- 为后续规则引擎运行时加载与 REST 接口集成打基础。
 
 **端到端思路**
 
@@ -68,39 +68,40 @@
 - 产物：`artifacts/<domain>/<doc>.items.normalized.json`
 - 代码：`src/layer2_5_normalize_items.py`
 
-### Layer 3 ｜ OpenRules 规则生成（合并/去重/冲突消解）
+### Layer 3 ｜ business-rules 规则生成与运行（合并/去重/冲突消解）
 
 - 动作：
-  - 读取静态抽取文件：`*.extraction(.detailed|.json)` 或 `*.items.normalized.json`（`list_extractions`，`src/layer3_openrules_builder.py:14-19`）
-  - 将每条抽取转为决策行：`RuleId/FieldName/Category/Level/Condition/Exception/Citation/Priority/Source`（`collect_static_rules`，`src/layer3_openrules_builder.py:22-69`）
-  - 读取动态规则：
-    - 结构化规则表（CSV/XLSX）：统一字段名并生成行（`read_dynamic_rules`，`src/layer3_openrules_builder.py:93-135`）
-    - 字段表（多表 Excel）：规范列头、解析 `classification` 与 `grade` 到 S1~S4，拼装 `Citation`（`read_dynamic_rules_excel`，`src/layer3_openrules_builder.py:138-190`；依赖 `src/data_preprocess.py`）
-  - 合并并冲突消解（`resolve_conflicts`）：
-    - 键：`FieldName|Category`；等级优先：S4>S3>S2>S1；同级取较小 `Priority`
-    - 合并 `Condition`/`Exception`（`OR` 连接）、`Citation`（`||` 连接）、`Source`（`;` 连接）（`src/layer3_openrules_builder.py:241-300`）
-    - 重新编号 `RuleId=R-*`
-  - 写出 OpenRules：`Classifier.csv`、`Classifier.json`（`write_openrules_table`，`src/layer3_openrules_builder.py:193-227`）
+  - 读取静态抽取文件与动态规则（CSV/XLSX），统一为规则行并进行冲突消解：键 `FieldName|Category`、等级优先（S4>S3>S2>S1）、同级取较小 `Priority`，合并 `Condition/Exception/Citation/Source` 与 `PatternKeywords/PatternRegex`
+  - 将规则行转换为 business-rules JSON：
+    - 条件：`field_name equal_to`、`category_path equal_to`，并以 `value_text contains/matches_regex` 组合关键词与正则
+    - 动作：`set_classification(level, rule_id)`、`append_audit(citation, source)`
+  - 导出变量/动作定义供前端构建规则 UI（`export_rule_data`）
 - 产物：
-  - `openrules/<domain>/Classifier.csv`
-  - `openrules/<domain>/Classifier.json`
-- 代码：`src/layer3_openrules_builder.py`
+  - `rules/<domain>/rules.json`
+  - `rules/<domain>/export_rule_data.json`
+- 代码：`src/layer3_business_rules_builder.py`、`src/rules/variables.py`、`src/rules/actions.py`
 
 ### LLM 客户端与示例提示
 
 - 客户端：ZhipuAI SDK（GLM 4.6）`src/llm_client.py`
 - 示例提示：`src/prompt_examples.py`（为金融域提供骨架与“最小 item”示例）
 
+### 读取与转换依赖
+
+- PDF 读取：`pdfplumber`
+- Word 转换：优先 `docx2pdf`；Windows 平台可回退 `pywin32`（Word COM）
+- 不使用 `unoconv`
+
 ## 运行流程
 
-1. 准备指南 PDF：将对应领域的指南放入 `guide/<domain>/*.pdf`
+1. 准备指南文件：将对应领域的指南放入 `guide/<domain>/`（支持 `*.pdf`、`*.docx`、`*.doc`）
 2. 配置动态规则：将 Excel 规则放入 `excels/<domain>/`
 3. 按顺序运行以下脚本：
    - `python src/layer1_reader.py`
    - `python src/layer1_5_catalog.py`（可选，根据是否需要跨文档目录聚合）
    - `python src/layer2_extractor.py`
    - `python src/layer2_5_normalize_items.py`
-   - `python src/layer3_openrules_builder.py`
+   - `python src/layer3_business_rules_builder.py`
 
 ## 产物目录
 
@@ -108,7 +109,7 @@
 - 路径 seeds 与片段：`artifacts/<domain>/<doc>.taxonomy_seeds.json`、`artifacts/<domain>/<doc>.fragments.json`
 - 抽取明细：`artifacts/<domain>/<doc>.extraction.detailed.json`
 - 归一化项：`artifacts/<domain>/<doc>.items.normalized.json`
-- OpenRules 决策表：`openrules/<domain>/Classifier.csv`、`openrules/<domain>/Classifier.json`
+- business-rules 规则：`rules/<domain>/rules.json`、`rules/<domain>/export_rule_data.json`
 
 ## 后续需要实现的功能
 
@@ -122,7 +123,7 @@
   - 报告导出（`classification_results.json`、`audit_report.json`）。
 
 - 用 langchain 进行拼接，或者 langgraph 进行额外的专家审议，更加严格和标准
-- 加入前端设计，可以上传指南或者 agent 联网搜索指定领域，动态规则设计完成
+- 加入前端设计，可以上传指南或者 agent 联网搜索指定领域，动态规则设计完成。前端在第一步上传指南时，需要选择领域以及输入标准号
 - 在模版中间卡一下，可以生成一个模版供参考。如果完全考虑不到的内容是否可以只到四级分类。因为目的是对字段进行分类
 - l3 需要补充规则的具体内容，正则和关键词
 
@@ -134,6 +135,8 @@
 - `src/layer1_5_catalog.py`｜域内目录聚合
 - `src/layer2_extractor.py`｜分组并行抽取，路径级证据 + 多 item
 - `src/layer2_5_normalize_items.py`｜同义归一与扁平化
-- `src/layer3_openrules_builder.py`｜合并生成 OpenRules 决策表
+- `src/layer3_business_rules_builder.py`｜合并生成 business-rules 规则集
+- `src/rules/variables.py`｜规则变量定义
+- `src/rules/actions.py`｜规则动作定义
 - `src/llm_client.py`｜ GLM 客户端
 - `src/prompt_examples.py`｜少样本示例
