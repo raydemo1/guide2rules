@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Dict, List
+from typing import Dict, List, Any
 
 
 def load_taxonomies(domain_dir: str) -> List[Dict]:
@@ -13,86 +13,115 @@ def load_taxonomies(domain_dir: str) -> List[Dict]:
     return items
 
 
-def _tree_to_map(tree: List[Dict]) -> Dict[str, Dict[str, Dict[str, set]]]:
-    m: Dict[str, Dict[str, Dict[str, set]]] = {}
+def _node_name(node: Dict[str, Any]) -> str:
+    if 'name' in node:
+        return (node.get('name') or '').strip()
+    # 兼容 level1..levelN 命名
+    for k in sorted(node.keys()):
+        if k.startswith('level'):
+            return (node.get(k) or '').strip()
+    return ''
+
+
+def _collect_paths(tree: List[Dict]) -> List[List[str]]:
+    paths: List[List[str]] = []
+
+    def walk(node: Dict[str, Any], acc: List[str]):
+        if not isinstance(node, dict):
+            return
+        name = _node_name(node)
+        cur = acc + ([name] if name else [])
+        children = node.get('children') or []
+        if children:
+            for ch in children:
+                walk(ch, cur)
+        else:
+            if cur:
+                paths.append(cur)
+
     for root in tree or []:
-        l1 = root.get('level1') or ''
-        if not l1:
-            continue
-        m1 = m.setdefault(l1, {})
-        for c2 in root.get('children', []) or []:
-            l2 = c2.get('level2') or ''
-            if not l2:
-                continue
-            m2 = m1.setdefault(l2, {})
-            for c3 in c2.get('children', []) or []:
-                l3 = c3.get('level3') or ''
-                if not l3:
-                    continue
-                s4 = m2.setdefault(l3, set())
-                for c4 in c3.get('children', []) or []:
-                    l4 = c4.get('level4') or ''
-                    if l4:
-                        s4.add(l4)
-    return m
+        walk(root, [])
+    return paths
 
 
-def _map_to_tree(m: Dict[str, Dict[str, Dict[str, set]]]) -> List[Dict]:
-    out = []
-    for l1 in sorted(m.keys()):
-        node1 = {'level1': l1, 'children': []}
-        for l2 in sorted(m[l1].keys()):
-            node2 = {'level2': l2, 'children': []}
-            for l3 in sorted(m[l1][l2].keys()):
-                node3 = {'level3': l3, 'children': []}
-                level4s = sorted(list(m[l1][l2][l3]))
-                node3['children'] = [{'level4': l4} for l4 in level4s]
-                node2['children'].append(node3)
-            node1['children'].append(node2)
-        out.append(node1)
+def _merge_tree_nodes(trie: Dict[str, Any], node: Dict[str, Any], depth: int):
+    name = _node_name(node)
+    if not name:
+        return
+    cur = trie.setdefault(name, { 'level': int(node.get('level') or depth), 'items': set(), 'children': {} })
+    lvl = int(node.get('level') or depth)
+    # 统一level为最小深度或已有一致值
+    cur['level'] = min(cur.get('level', lvl), lvl)
+    # 合并items
+    if isinstance(node.get('items'), list):
+        for it in node['items']:
+            s = str(it or '').strip()
+            if s:
+                cur['items'].add(s)
+    # 递归children
+    for ch in node.get('children') or []:
+        _merge_tree_nodes(cur['children'], ch, depth + 1)
+
+
+def _trie_to_tree(trie: Dict[str, Any]) -> List[Dict]:
+    out: List[Dict] = []
+    for name in trie.keys():
+        rec = trie[name]
+        node: Dict[str, Any] = { 'name': name, 'level': rec.get('level', 1) }
+        if rec.get('children'):
+            node['children'] = _trie_to_tree(rec['children'])
+        if rec.get('items'):
+            items_list = sorted(list(rec['items']))
+            if items_list:
+                node['items'] = items_list
+        out.append(node)
     return out
 
 
 def merge_taxonomies(taxonomies: List[Dict]) -> Dict:
-    levels: Dict[str, str] = {}
-    merged_map: Dict[str, Dict[str, Dict[str, set]]] = {}
+    merged_levels = []
     for tx in taxonomies:
         for lv in tx.get('levels_definition', []) or []:
-            code = (lv.get('code') or '').strip()
-            desc = (lv.get('description') or '').strip()
-            if not code:
-                continue
-            if code not in levels or (desc and len(desc) > len(levels.get(code, ''))):
-                levels[code] = desc
-        tmap = _tree_to_map(tx.get('tree') or [])
-        for l1, m1 in tmap.items():
-            mm1 = merged_map.setdefault(l1, {})
-            for l2, m2 in m1.items():
-                mm2 = mm1.setdefault(l2, {})
-                for l3, s4 in m2.items():
-                    ss4 = mm2.setdefault(l3, set())
-                    ss4.update(s4)
-    merged_levels = [{'code': k, 'description': levels[k]} for k in sorted(levels.keys())]
-    merged_tree = _map_to_tree(merged_map)
-    return {'levels_definition': merged_levels, 'tree': merged_tree}
+            merged_levels.append(lv)
+
+    trie: Dict[str, Any] = {}
+    for tx in taxonomies:
+        for root in tx.get('tree') or []:
+            _merge_tree_nodes(trie, root, depth=1)
+    merged_tree = _trie_to_tree(trie)
+    return { 'levels_definition': merged_levels, 'tree': merged_tree }
+
+
+def _collect_path_items(tree: List[Dict]) -> List[Dict]:
+    out: List[Dict] = []
+    def walk(node: Dict[str, Any], acc: List[str]):
+        name = _node_name(node)
+        cur = acc + ([name] if name else [])
+        children = node.get('children') or []
+        if children:
+            for ch in children:
+                walk(ch, cur)
+        else:
+            if cur:
+                items = []
+                if isinstance(node.get('items'), list):
+                    items = [str(x or '').strip() for x in node['items'] if str(x or '').strip()]
+                entry: Dict[str, Any] = { 'path': cur }
+                if items:
+                    entry['items'] = items
+                out.append(entry)
+    for root in tree or []:
+        walk(root, [])
+    return out
 
 
 def write_merged(domain_dir: str, merged: Dict):
     out_tax = os.path.join(domain_dir, 'taxonomy.merged.json')
     with open(out_tax, 'w', encoding='utf-8') as fp:
         json.dump(merged, fp, ensure_ascii=False, indent=2)
-    # 同时写 seeds，便于后续直接使用
-    paths = []
-    for root in merged.get('tree') or []:
-        l1 = root.get('level1') or ''
-        for c2 in root.get('children', []) or []:
-            l2 = c2.get('level2') or ''
-            for c3 in c2.get('children', []) or []:
-                l3 = c3.get('level3') or ''
-                for c4 in c3.get('children', []) or []:
-                    l4 = c4.get('level4') or ''
-                    paths.append({'level1': l1, 'level2': l2, 'level3': l3, 'level4': l4})
-    seeds = {'levels': merged.get('levels_definition', []), 'paths': paths}
+    # seeds 跟随layer1格式，包含items（如有）
+    path_items = _collect_path_items(merged.get('tree') or [])
+    seeds = {'levels': merged.get('levels_definition', []), 'paths': path_items}
     out_seeds = os.path.join(domain_dir, 'taxonomy_seeds.merged.json')
     with open(out_seeds, 'w', encoding='utf-8') as fp:
         json.dump(seeds, fp, ensure_ascii=False, indent=2)

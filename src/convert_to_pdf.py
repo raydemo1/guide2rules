@@ -1,13 +1,14 @@
 import os
 
 
-def convert_docx_to_pdf(path: str) -> str:
+def convert_docx_to_pdf(path: str, out_dir: str) -> str:
     try:
         import docx2pdf  # type: ignore
     except Exception:
         docx2pdf = None
-    base, _ = os.path.splitext(path)
-    out_pdf = base + ".converted.pdf"
+    os.makedirs(out_dir, exist_ok=True)
+    base_name = os.path.splitext(os.path.basename(path))[0]
+    out_pdf = os.path.join(out_dir, base_name + ".converted.pdf")
     if docx2pdf:
         docx2pdf.convert(path, out_pdf)
         return out_pdf
@@ -31,13 +32,14 @@ def convert_docx_to_pdf(path: str) -> str:
             pass
 
 
-def convert_doc_to_pdf(path: str) -> str:
+def convert_doc_to_pdf(path: str, out_dir: str) -> str:
     try:
         import win32com.client  # type: ignore
     except Exception:
         raise RuntimeError("Missing pywin32 for DOC->PDF conversion on this platform")
-    base, _ = os.path.splitext(path)
-    out_pdf = base + ".converted.pdf"
+    os.makedirs(out_dir, exist_ok=True)
+    base_name = os.path.splitext(os.path.basename(path))[0]
+    out_pdf = os.path.join(out_dir, base_name + ".converted.pdf")
     word = None
     try:
         word = win32com.client.Dispatch("Word.Application")
@@ -52,4 +54,3 @@ def convert_doc_to_pdf(path: str) -> str:
                 word.Quit()
         except Exception:
             pass
-

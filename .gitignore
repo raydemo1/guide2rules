@@ -219,3 +219,5 @@ openrules/
 
 #test
 test/
+outputs/
+rules/

@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from typing import Dict, List
 
 from pdf_plumber_text import read_pdf_plumber_text
@@ -7,17 +8,22 @@ from convert_to_pdf import convert_docx_to_pdf, convert_doc_to_pdf
 from llm_client import chat
 from prompt_examples import get_layer1_examples
 from domains import detect_domain
+from layer1_table_parser import build_taxonomy_from_tables, build_pre_extracted_items
 
 
 def join_pages(pages: List[str]) -> str:
     return "\n\n".join(pages)
 
 
+def clean_cell_text(s: str) -> str:
+    """清理表格单元格内容：去掉换行、多余空格"""
+    return re.sub(r"\s+", " ", s or "").strip()
+
+
 def extract_taxonomy_and_glossary(text: str, source: str, domain: str) -> Dict:
     print(f"[DEBUG] 开始提取分类体系和术语表")
     print(f"[DEBUG] 来源: {source}")
     print(f"[DEBUG] 域名: {domain}")
-    print(f"[DEBUG] 文本长度: {len(text)} 字符")
 
     system = (
         "你是“数据分类分级知识层 Agent”。请基于指南文本提炼领域的分级体系（如有，级别格式统一为 S+数字，例如 S1、S2、S3…；"
@@ -37,10 +43,10 @@ def extract_taxonomy_and_glossary(text: str, source: str, domain: str) -> Dict:
         "2. tree 表示分类体系（如存在）。"
         "若指南未提供分类体系，则 tree 返回空数组。"
         "若指南提供分类体系："
-        "—— 分类层级数量必须与指南文本实际结构一致。"
-        "—— 最大层级 = 文本中出现的最深层级。"
-        "—— 所有分类路径必须补齐至该最大层级，缺失层级用 name: '' 填补。"
-        "—— 每个分类节点格式为：{name: '分类名称或空', children: [...] }。"
+        "—— 分类层级数量必须与指南文本实际结构一致，可为任意深度。"
+        "—— 不得强制补齐到最深层级；不得为缺失层级填充空名称。"
+        "—— 每个分类节点必须包含 {level: 数字, name: 名称, children: [...]}；level 从 1 开始逐级递增，深度不限。"
+        "—— 节点结构示例：{level:1, name:'基础设施', children:[ {level:2, name:'公路交通基础设施', children:[ ... ]} ]}。"
         "若指南文本中已经给出最小颗粒度字段（items，例如字段名、字段代码、具体数据项），"
         "则允许在最底层增加 'items': ['item1', 'item2', ...] 字段，用于保留原始字段。"
         "若指南未给出字段名，则不得创建 items。"
@@ -86,51 +92,77 @@ def extract_taxonomy_and_glossary(text: str, source: str, domain: str) -> Dict:
     return obj
 
 
-def build_seeds(taxonomy: Dict) -> Dict:
-    levels = taxonomy.get("levels_definition", [])
-    paths: List[Dict] = []
+def validate_taxonomy_with_llm(taxonomy: Dict, source: str, domain: str) -> Dict:
+    print(f"[DEBUG] 使用LLM校验并修复taxonomy结构")
+    system = (
+        "你是JSON结构校验与修复Agent。"
+        "输入包含taxonomy对象，可能存在层级缺失、键不规范或结构不一致。"
+        "请输出严格合法的JSON，仅包含: {taxonomy}，其中 taxonomy 顶层为 {levels_definition, tree}。"
+        "tree 节点必须统一为 {level: 数字>=1, name: 字符串, children: [可选]} 格式，深度不限；"
+        "若children不存在则去掉该键；禁止添加输入未出现的分类名称；仅允许修复结构，不得补齐空名称或强行填充缺失层级。"
+        "levels_definition 若不存在则返回空数组。"
+        "禁止输出任何非JSON内容。"
+    )
+    user = json.dumps(
+        {"domain": domain, "source": source, "taxonomy": taxonomy}, ensure_ascii=False
+    )
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+    content = chat(messages)
+    s = content.find("{")
+    e = content.rfind("}")
+    if s == -1 or e == -1:
+        print("[DEBUG] LLM未返回JSON，使用原taxonomy")
+        return taxonomy
+    json_str = content[s : e + 1]
+    try:
+        obj = json.loads(json_str)
+        fixed = obj.get("taxonomy") or taxonomy
+        return fixed
+    except Exception:
+        print("[DEBUG] 校验解析失败，使用原taxonomy")
+        return taxonomy
 
-    def walk(node, p):
-        if not node:
-            return
-        if "level1" in node:
-            for c2 in node.get("children", []):
-                walk(
-                    {"level2": c2.get("level2"), "children": c2.get("children", [])},
-                    [node.get("level1")],
-                )
-        elif "level2" in node:
-            for c3 in node.get("children", []):
-                walk(
-                    {"level3": c3.get("level3"), "children": c3.get("children", [])},
-                    p + [node.get("level2")],
-                )
-        elif "level3" in node:
-            for c4 in node.get("children", []):
-                lvl4 = c4.get("level4")
-                paths.append(
-                    {
-                        "level1": p[0] if len(p) > 0 else "",
-                        "level2": p[1] if len(p) > 1 else "",
-                        "level3": p[2] if len(p) > 2 else "",
-                        "level4": lvl4,
-                    }
-                )
+
+def build_seeds(taxonomy: Dict, fragments: List[Dict]) -> Dict:
+    levels = taxonomy.get("levels_definition", [])
+
+    def node_name(node: Dict) -> str:
+        if "name" in node:
+            return str(node.get("name") or "").strip()
+        for k in sorted(node.keys()):
+            if k.startswith("level"):
+                return str(node.get(k) or "").strip()
+        return ""
+
+    path_items: List[Dict] = []
+
+    def walk(node: Dict, acc: List[str]):
+        nm = node_name(node)
+        cur = acc + ([nm] if nm else [])
+        children = node.get("children") or []
+        if children:
+            for ch in children:
+                walk(ch, cur)
         else:
-            return
+            if cur:
+                items = []
+                if isinstance(node.get("items"), list):
+                    items = [
+                        str(x or "").strip()
+                        for x in node.get("items")
+                        if str(x or "").strip()
+                    ]
+                path_items.append({"path": cur, "items": items})
 
     tree = taxonomy.get("tree")
     if isinstance(tree, list):
         for root in tree:
             walk(root, [])
-    return {"levels": levels, "paths": paths}
 
-
-def build_fragments(pages: List[str]) -> List[Dict]:
-    frags = []
-    for i, p in enumerate(pages, 1):
-        frags.append({"page": i, "text": p})
-    return frags
+    return {"levels": levels, "paths": path_items}
 
 
 def main():
@@ -138,6 +170,8 @@ def main():
 
     root = os.path.dirname(os.path.dirname(__file__))
     guide_dir = os.path.join(root, "guide")
+    tmp_dir = os.path.join(root, "artifacts", "tmp")
+    os.makedirs(tmp_dir, exist_ok=True)
     print(f"[DEBUG] 指南文件目录: {guide_dir}")
 
     files = []
@@ -160,35 +194,95 @@ def main():
             frags = read_pdf_plumber_text(path)
         elif ext == ".docx":
             print(f"[DEBUG] 转换DOCX为PDF...")
-            pdf_path = convert_docx_to_pdf(path)
+            pdf_path = convert_docx_to_pdf(path, tmp_dir)
             print(f"[DEBUG] 读取转换后的PDF(通过pdfplumber): {pdf_path}")
-            frags = read_pdf_plumber_text(pdf_path)
+            try:
+                frags = read_pdf_plumber_text(pdf_path)
+            finally:
+                try:
+                    os.remove(pdf_path)
+                except Exception:
+                    pass
         elif ext == ".doc":
             print(f"[DEBUG] 转换DOC为PDF...")
-            pdf_path = convert_doc_to_pdf(path)
+            pdf_path = convert_doc_to_pdf(path, tmp_dir)
             print(f"[DEBUG] 读取转换后的PDF(通过pdfplumber): {pdf_path}")
-            frags = read_pdf_plumber_text(pdf_path)
+            try:
+                frags = read_pdf_plumber_text(pdf_path)
+            finally:
+                try:
+                    os.remove(pdf_path)
+                except Exception:
+                    pass
         else:
             raise RuntimeError(f"不支持的文件类型: {ext}")
         print(f"[DEBUG] 读取到 {len(frags)} 段")
 
-        text = join_pages([f["text"] for f in frags])
-        print(f"[DEBUG] 合并后文本长度: {len(text)} 字符")
+        # 构建 fragments：保留结构化表格和原始标题/段落
+        fragments: List[Dict] = []
+        for f in frags:
+            if f.get("type") == "table":
+                headers = f.get("rows", [])[:1]
+                data_rows = f.get("rows", [])[1:] if f.get("rows") else []
+                fragments.append(
+                    {
+                        "type": "table",
+                        "page": f.get("page", 0),
+                        "headers": headers[0] if headers else [],
+                        "rows": data_rows,
+                        "fields": f.get("fields", []),
+                    }
+                )
+            else:
+                t = re.sub(r"\s+", " ", f.get("text") or "").strip()
+                if t:
+                    fragments.append(
+                        {
+                            "type": f.get("type"),
+                            "text": t,
+                            "level": f.get("level", ""),
+                            "page": f.get("page", 0),
+                        }
+                    )
 
-        obj = extract_taxonomy_and_glossary(text, path, domain)
-        taxonomy = obj.get("taxonomy", {})
-        glossary = obj.get("glossary", [])
-        seeds = build_seeds(taxonomy)
-        fragments = frags
-
-        print(f"[DEBUG] 构建了 {len(fragments)} 个文本片段")
-
+        # 先尝试基于表格直接解析，成功则跳过 LLM 与文本拼接
+        parsed = build_taxonomy_from_tables(frags)
+        pre_items = build_pre_extracted_items(
+            frags, domain, os.path.join("guide", os.path.basename(path))
+        )
         out_dir = os.path.join(root, "artifacts", domain)
         os.makedirs(out_dir, exist_ok=True)
         base = os.path.splitext(os.path.basename(path))[0].replace(" ", "_")
-
-        print(f"[DEBUG] 输出目录: {out_dir}")
-        print(f"[DEBUG] 基础文件名: {base}")
+        if pre_items.get("extraction"):
+            taxonomy = validate_taxonomy_with_llm(
+                parsed, os.path.join("guide", os.path.basename(path)), domain
+            )
+            glossary = []
+            print(f"[DEBUG] 直接使用表格解析的预抽取items，跳过LLM")
+            with open(
+                os.path.join(out_dir, f"{base}.items.pre_extracted.json"),
+                "w",
+                encoding="utf-8",
+            ) as f:
+                json.dump(pre_items, f, ensure_ascii=False, indent=2)
+            # 保存结构化表格以便审计
+            tables_only = [frag for frag in fragments if frag.get("type") == "table"]
+            with open(
+                os.path.join(out_dir, f"{base}.tables.json"), "w", encoding="utf-8"
+            ) as f:
+                json.dump({"tables": tables_only}, f, ensure_ascii=False, indent=2)
+        else:
+            text_segs = [
+                frag.get("text")
+                for frag in fragments
+                if frag.get("type") in ("title", "paragraph")
+            ]
+            final_text = "\n\n".join([seg for seg in text_segs if seg])
+            print(f"[DEBUG] 合并后文本长度: {len(final_text)} 字符")
+            obj = extract_taxonomy_and_glossary(final_text, path, domain)
+            taxonomy = obj.get("taxonomy", {})
+            glossary = obj.get("glossary", [])
+        seeds = build_seeds(taxonomy, fragments)
 
         print(f"[DEBUG] 保存taxonomy.json...")
         with open(

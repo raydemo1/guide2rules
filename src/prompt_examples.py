@@ -35,63 +35,125 @@ def get_layer1_examples(domain: str):
             ],
             "tree": [
                 {
-                    "level1": "经营管理",
+                    "level": 1,
+                    "name": "基础设施",
                     "children": [
                         {
-                            "level2": "综合管理",
+                            "level": 2,
+                            "name": "公路交通基础设施",
                             "children": [
                                 {
-                                    "level3": "员工信息",
+                                    "level": 3,
+                                    "name": "公路",
                                     "children": [
-                                        {"level4": "一般员工信息(公开)"},
-                                        {"level4": "员工信息(非公开)"},
-                                    ],
-                                }
-                            ],
-                        }
-                    ],
-                },
-                {
-                    "level1": "运营管理",
-                    "children": [
-                        {
-                            "level2": "客户服务信息",
-                            "children": [
+                                        {
+                                            "level": 4,
+                                            "name": "路线",
+                                            "children": [
+                                                {
+                                                    "level": 5,
+                                                    "name": "基本信息",
+                                                    "items": [
+                                                        "路线编号",
+                                                        "路线名称",
+                                                        "起点名称",
+                                                        "止点名称",
+                                                        "起点桩号",
+                                                        "止点桩号",
+                                                        "起点行政区划代码",
+                                                        "止点行政区划代码",
+                                                        "路线经过行政区划",
+                                                        "路线里程"
+                                                    ]
+                                                },
+                                                {
+                                                    "level": 5,
+                                                    "name": "阻断信息",
+                                                    "items": [
+                                                        "受阻路段位置描述",
+                                                        "阻断位置所属行政区划代码",
+                                                        "现场描述",
+                                                        "事件起始桩号",
+                                                        "事件终止桩号",
+                                                        "阻断发现时间",
+                                                        "预计恢复时间",
+                                                        "实际恢复时间",
+                                                        "阻断原因",
+                                                        "阻断类型",
+                                                        "道路是否中断",
+                                                        "上行或下行属性",
+                                                        "桥梁代码",
+                                                        "隧道代码",
+                                                        "阻断影响里程",
+                                                        "相邻省行政区划代码",
+                                                        "处置措施名称",
+                                                        "上报单位名称",
+                                                        "联系电话",
+                                                        "单位传真号码"
+                                                    ]
+                                                }
+                                            ]
+                                        },
+                                        {
+                                            "level": 4,
+                                            "name": "路段",
+                                            "children": [
+                                                {
+                                                    "level": 5,
+                                                    "name": "基本信息",
+                                                    "items": [
+                                                        "路段编号",
+                                                        "所属路线编号",
+                                                        "所属路线名称",
+                                                        "所属行政区划代码",
+                                                        "起点名称",
+                                                        "止点名称",
+                                                        "起点桩号",
+                                                        "止点桩号",
+                                                        "里程",
+                                                        "技术等级",
+                                                        "是否城管路段",
+                                                        "是否待贯通",
+                                                        "桥梁名称",
+                                                        "桥梁代码"
+                                                    ]
+                                                }
+                                            ]
+                                        }
+                                    ]
+                                },
                                 {
-                                    "level3": "网络服务标识",
-                                    "children": [{"level4": "IP"}],
+                                    "level": 3,
+                                    "name": "桥梁",
+                                    "children": [
+                                        {
+                                            "level": 4,
+                                            "name": "基本信息"
+                                        }
+                                    ]
                                 }
-                            ],
+                            ]
                         }
-                    ],
-                },
-                {
-                    "level1": "单位",
-                    "children": [
-                        {
-                            "level2": "单位基本信息",
-                            "children": [
-                                {
-                                    "level3": "基本信息",
-                                    "children": [{"level4": "统一社会信用代码"}],
-                                }
-                            ],
-                        }
-                    ],
-                },
+                    ]
+                }
             ],
         },
         "glossary": [
             {
-                "term": "手机号",
-                "definition": "移动电话号码",
-                "synonyms": ["手机号码", "电话号"],
+                "term": "路线编号",
+                "definition": "公路路线的唯一标识编号",
+                "synonyms": ["路线代码"],
             },
             {
-                "term": "身份证号",
-                "definition": "居民身份证号码",
-                "synonyms": ["身份证"],
+                "term": "行政区划代码",
+                "definition": "国家标准行政区划编码",
+                "synonyms": ["区划代码"],
             },
+            {
+                "term": "桩号",
+                "definition": "公路里程桩标识",
+                "synonyms": ["里程桩"],
+            }
         ],
     }
     return [
@@ -106,12 +168,7 @@ def get_layer2_examples(domain: str):
         "source": "example.pdf",
         "extraction": [
             {
-                "path": {
-                    "level1": "运营管理",
-                    "level2": "客户服务信息",
-                    "level3": "网络服务标识",
-                    "level4": "网络服务标识",
-                },
+                "path": ["运营管理", "客户服务信息", "网络服务标识"],
                 "citation": {"page": 12, "text": "网络服务标识包含IP、URL等"},
                 "items": [
                     {
@@ -137,12 +194,7 @@ def get_layer2_examples(domain: str):
                 ],
             },
             {
-                "path": {
-                    "level1": "经营管理",
-                    "level2": "综合管理",
-                    "level3": "员工信息",
-                    "level4": "员工信息(非公开)",
-                },
+                "path": ["经营管理", "综合管理", "员工信息", "员工信息(非公开)"],
                 "citation": {
                     "page": 8,
                     "text": "员工信息(非公开)包括电子邮箱、手机号等",
@@ -173,12 +225,7 @@ def get_layer2_examples(domain: str):
                 ],
             },
             {
-                "path": {
-                    "level1": "客户",
-                    "level2": "个人",
-                    "level3": "基础身份信息",
-                    "level4": "身份标识",
-                },
+                "path": ["客户", "个人", "基础身份信息", "身份标识"],
                 "citation": {"page": 20, "text": "身份标识包括身份证号等"},
                 "items": [
                     {
@@ -194,12 +241,7 @@ def get_layer2_examples(domain: str):
                 ],
             },
             {
-                "path": {
-                    "level1": "客户",
-                    "level2": "个人",
-                    "level3": "基础身份信息",
-                    "level4": "联系方式",
-                },
+                "path": ["客户", "个人", "基础身份信息"],
                 "citation": {"page": 20, "text": "联系方式包括手机号等"},
                 "items": [
                     {
@@ -215,12 +257,7 @@ def get_layer2_examples(domain: str):
                 ],
             },
             {
-                "path": {
-                    "level1": "单位",
-                    "level2": "单位基本信息",
-                    "level3": "基本信息",
-                    "level4": "基本信息",
-                },
+                "path": ["单位", "单位基本信息", "基本信息", "基本信息", "编码"],
                 "citation": {"page": 5, "text": "单位基本信息包括统一社会信用代码"},
                 "items": [
                     {
@@ -238,6 +275,6 @@ def get_layer2_examples(domain: str):
         ],
     }
     return [
-        {"role": "user", "content": "示例：按四级路径返回最小数据项"},
+        {"role": "user", "content": "示例：按可变层级路径返回最小数据项（路径为数组，允许3–5层，按实际停止）"},
         {"role": "assistant", "content": str(ex)},
     ]

@@ -1,142 +1,158 @@
 # guide2rules
 
-通过大模型（GLM）将“数据分类分级指南”自动转化为可执行的业务规则（business-rules），并生成可审计的证据与规范化的数据项。项目采用分层管线实现：先抽取领域分类骨架，再对每条细粒度路径批量枚举最小数据项，随后归一化并与人工/Excel 动态规则合并，最终产出可在运行时加载的规则集。
+通过大模型（GLM）将“数据分类分级指南”自动转化为可执行的业务规则（business‑rules），并生成可审计的证据与规范化的数据项。项目采用分层管线：先抽取领域分类骨架，再对每条细粒度路径批量枚举最小数据项，随后做术语归一与规则融合，最终产出可在运行时加载的规则集，并对表格数据进行自动分类与分级。
 
-**核心目标**
+核心目标
 
-- 将不同领域的指南（PDF）结构化为统一的四级分类骨架与术语表。
-- 为每条 `level4` 路径抽取最小数据项及路径级证据，保证可追溯。
-- 归一化同义项与口径，合并静态抽取与动态规则，生成 business-rules 规则集并进行去重与冲突消解。
-- 为后续规则引擎运行时加载与 REST 接口集成打基础。
+- 将不同领域的指南结构化为统一的层级分类骨架与术语表
+- 为每条路径抽取最小数据项及路径级证据，保证可追溯
+- 归一化同义项与口径，合并静态抽取与动态规则，生成规则集并进行去重与冲突消解
+- 在运行时加载规则，对字段进行分类分级并输出审计
 
-**端到端思路**
+整体流程
 
-- 先由大模型抽取“分类骨架”（Layer 1），再对骨架的每个 `level4` 路径批量枚举最小数据项（Layer 2），并保留路径级证据。
-- 使用术语表归一化同义项（Layer 2.5），将抽取得到的最小项转为标准字段名与口径。
-- 将抽取结果与人工/Excel 动态规则合并（Layer 3），生成 OpenRules 决策表并进行去重与冲突消解。
-- 后续在运行时加载决策表，对数据字段进行分类分级并输出标签与审计。
+1. 读指南：把 PDF/Word 读成“段落/标题/表格”的结构化片段
+2. 搭骨架：先从文本或表格里提炼领域的分类树和术语表
+3. 找路径：把分类树按层级拆成很多“level1/level2/…/levelN”的路径（每条路径代表一个最细分类）
+4. 抽最小项：针对每条路径，到上下文片段中找“最小数据项”（如 身份证号、路线编号等），并给出证据与匹配关键词/正则
+5. 统一口径：用术语表把同义词合成标准名称（如“行政区划代码”与“区划代码”统一）
+6. 生成规则：把所有最小项与动态 Excel 规则合并、去重、冲突消解，生成分类与分级两套可执行规则
+7. 运行时分类分级：读取 Excel 数据，套用规则，自动写出“分类路径/分级/规则 ID/审计”四列
 
-## 分层管线
+分层管线（实现细节）
 
-### Layer 1 ｜知识层（骨架）
+Layer 1 ｜知识层（骨架与术语）
 
-- 输入：`guide/<domain>/*.pdf`
-- 动作：
-  - 读取 PDF 文本为逐页 `pages`（`src/pdf_text.py` 的 `read_pdf_text` 使用 `pypdf`）
-  - 拼接全文并构造消息：`system` 说明仅返回严格 JSON；`examples` 来自 `get_layer1_examples(domain)`；`user` 包含来源与全文（`src/layer1_reader.py:41-60`）
-  - 调用 GLM 并截取首尾大括号确保合法 JSON（`src/layer1_reader.py:63-71`）；补充 `taxonomy.domain/source`
-  - 遍历 `taxonomy.tree` 生成四级路径 `paths` 与 `levels`（`build_seeds`，`src/layer1_reader.py:83-121`）
-  - 将每页文本生成 `fragments=[{page,text}]`（`build_fragments`，`src/layer1_reader.py:123-127`）
-  - 写出产物：`taxonomy.json`、`glossary.json`、`taxonomy_seeds.json`、`fragments.json`
-- 产物：
-  - `artifacts/<domain>/<doc>.taxonomy.json`
-  - `artifacts/<domain>/<doc>.glossary.json`
-  - `artifacts/<domain>/<doc>.taxonomy_seeds.json`（含 `paths`：`level1..level4`）
-  - `artifacts/<domain>/<doc>.fragments.json`
-- 代码：`src/layer1_reader.py`
+- 输入：guide/<domain>/\*.{pdf,docx,doc}
+- 关键步骤：
+  - 统一读取：doc/docx 先转 PDF（src/convert_to_pdf.py:4‑33,35‑56）；PDF 解析用 pdfplumber（src/pdf_plumber_text.py:128‑198），一次性抽出三类片段：title、paragraph、table
+  - 表格增强：对表格做“向下填充 + 简单几何识别”以还原合并单元格（src/pdf_plumber_text.py:91‑111），并按首列聚组（src/pdf_plumber_text.py:113‑126）
+  - 优先表格直解析：若表格像“字段定义表/主数据表”，直接构造分类树与路径的最小项（src/layer1_table_parser.py:87‑173,176‑257）
+  - 回退 LLM：如表格不足以还原骨架，则拼接标题/段落文本，喂给 GLM 产 taxonomy/glossary（src/layer1_reader.py:23‑92），并对返回结构做校验修复（src/layer1_reader.py:95‑127）
+  - 构造 seeds：沿分类树叶子生成路径数组与叶子 items（src/layer1_reader.py:129‑166）
+- 输出：
+  - artifacts/<domain>/<doc>.taxonomy.json（分类树，可能为空 levels_definition）
+  - artifacts/<domain>/<doc>.glossary.json（术语与同义词）
+  - artifacts/<domain>/<doc>.taxonomy_seeds.json（paths 与可能的叶子 items）
+  - artifacts/<domain>/<doc>.fragments.json（结构化片段：标题/段落/表格）
+  - 若表格直解析：artifacts/<domain>/<doc>.items.pre_extracted.json 与 <doc>.tables.json
+- 主要代码：
+  - src/layer1_reader.py（主流程：main 在 src/layer1_reader.py:168‑317）
+  - src/pdf_plumber_text.py（PDF 结构化片段）
+  - src/layer1_table_parser.py（表格直解析分类树与预抽取 items）
 
-### Layer 1.5 ｜域内目录
+Layer 1.5 ｜域内目录合并（跨文档）
 
-- 动作：
-  - 扫描域目录下的 `*.taxonomy.json` 并加载（`load_taxonomies`，`src/layer1_5_catalog.py:6-21`）
-  - 遍历各 `tree`，在 `level3->children->level4->items` 处聚合候选项并按四级路径去重（`build_catalog`，`src/layer1_5_catalog.py:24-78`）
-  - 生成 `paths=[{level1..level4, items[]}]`
-- 产物：`artifacts/<domain>/catalog.json`
-- 代码：`src/layer1_5_catalog.py`
+- 作用：当同一领域有多份指南时，合并它们的分类树为“域内目录”，并生成对应 seeds，方便后续批量抽取
+- 步骤：
+  - 扫描 artifacts/<domain> 下所有 \*.taxonomy.json 并载入（src/layer1_5_catalog.py:6‑13）
+  - 将多棵树按“名称/层级”归并为一棵大树（src/layer1_5_catalog.py:47‑73,81‑93）
+  - 从合并树提炼路径与叶子 items，写出 seeds（src/layer1_5_catalog.py:95‑128）
+- 输出：
+  - artifacts/<domain>/taxonomy.merged.json
+  - artifacts/<domain>/taxonomy_seeds.merged.json
+- 入口：src/layer1_5_catalog.py:131‑147
 
-### Layer 2 ｜抽取器（路径级证据 + 最小项枚举，批量并行）
+Layer 2 ｜抽取器（路径级证据 + 最小项枚举，并行）
 
-- 动作：
-  - 读取 `taxonomy_seeds.json` 与 `fragments.json`（`run_for_artifact_dir`，`src/layer2_extractor.py:151-161`）
-  - 若存在 `paths`：
-    - 以 `(level1,level2)` 分组并按 `L2_BATCH_SIZE` 切片（`group_paths`，`src/layer2_extractor.py:48-59`）
-    - 为每组选择相关片段：四级路径词 + 通用关键词 + 域关键词评分，去重并截断至 `L2_PER_PATH_FRAG_LIMIT`/`L2_GROUP_FRAG_LIMIT`（`filter_fragments_for_group/path`，`src/layer2_extractor.py:62-84,218-243`）
-    - 以 `ThreadPoolExecutor(max_workers=L2_WORKERS)` 并行调用大模型（`extract_structured`），每条 `level4` 路径返回一次 `citation` 与 `items[]`（`src/layer2_extractor.py:94-143,175-205`）
-    - 汇总所有分组的 `extraction` 写出 `*.extraction.detailed.json`
-  - 若无 `paths`：走旧模式返回分类级结果，写出 `*.extraction.json`（`src/layer2_extractor.py:207-215`）
-  - 大模型入参：`{domain, seeds, fragments}`；出参：`{domain, source, extraction}`，其中 `extraction` 的每项结构为 `{path, citation, items[]}`（`src/layer2_extractor.py:100-111,119-141`）
-- 并行参数：`L2_WORKERS`、`L2_BATCH_SIZE`、`L2_PER_PATH_FRAG_LIMIT`、`L2_GROUP_FRAG_LIMIT`
-- 产物：`artifacts/<domain>/<doc>.extraction.detailed.json`
-- 代码：`src/layer2_extractor.py`
+- 输入：taxonomy_seeds.json 或 taxonomy_seeds.merged.json；对应的 fragments.json
+- 核心：
+  - 可变层级路径：path 是数组 [seg1,seg2,…]，深度按原文；不强行补齐（src/layer2_extractor.py:176‑185）
+  - 分组并行：按前 N 层分桶，再按 batch 切片，并发调用 GLM（src/layer2_extractor.py:144‑156,358‑385）
+  - 片段筛选：为每组/路径挑相关片段，评分来源于“路径词 + 通用关键词 + 域关键词”（src/layer2_extractor.py:92‑114,395‑418），关键词来源可配置（config/layer2_keywords.json）
+  - 严格 JSON：统一 system 提示，入参含 {domain,seeds,fragments}，返回 extraction 列表，项结构固定（src/layer2_extractor.py:176‑205,212‑217,159‑174）
+  - 预抽取增强：若 Layer 1 已从表格提到叶子 items，则直接让 LLM“补分级与匹配”，跳过证据检索（src/layer2_extractor.py:307‑324,260‑275）
+- 输出：artifacts/<domain>/<base>.extraction.detailed.json
+- 入口：src/layer2_extractor.py:420‑466；按域遍历，可用命令行指定域
 
-### Layer 2.5 ｜数据项归一化
+Layer 2.5 ｜数据项归一化（同义统一 + 扁平化）
 
-- 动作：
-  - 加载术语表并构造 `synonym->canonical` 映射（`load_glossary`，`src/layer2_5_normalize_items.py:6-34`）
-  - 将 `extraction.items[]` 扁平化为记录，并为每个 `name` 添加 `canonical`；保留共享 `citation` 与 `path`（`normalize_items`，`src/layer2_5_normalize_items.py:37-78`）
-  - 写出 `*.items.normalized.json`
-- 产物：`artifacts/<domain>/<doc>.items.normalized.json`
-- 代码：`src/layer2_5_normalize_items.py`
+- 输入：_.extraction.detailed.json 与对应 _.glossary.json
+- 处理：
+  - 从术语表构造“synonym→canonical”映射（src/layer2_5_normalize_items.py:6‑35）
+  - 将 extraction.items 扁平化为记录：每条包含 path、item{name,canonical,patterns}、level、conditions/exceptions、共享 citation（src/layer2_5_normalize_items.py:37‑80）
+- 输出：artifacts/<domain>/<base>.items.normalized.json
+- 入口：src/layer2_5_normalize_items.py:83‑130
 
-### Layer 3 ｜ business-rules 规则生成与运行（合并/去重/冲突消解）
+Layer 3 ｜规则生成（分类 + 分级，两阶段执行）
 
-- 动作：
-  - 读取静态抽取文件与动态规则（CSV/XLSX），统一为规则行并进行冲突消解：键 `FieldName|Category`、等级优先（S4>S3>S2>S1）、同级取较小 `Priority`，合并 `Condition/Exception/Citation/Source` 与 `PatternKeywords/PatternRegex`
-  - 将规则行转换为 business-rules JSON：
-    - 条件：`field_name equal_to`、`category_path equal_to`，并以 `value_text contains/matches_regex` 组合关键词与正则
-    - 动作：`set_classification(level, rule_id)`、`append_audit(citation, source)`
-  - 导出变量/动作定义供前端构建规则 UI（`export_rule_data`）
-- 产物：
-  - `rules/<domain>/rules.json`
-  - `rules/<domain>/export_rule_data.json`
-- 代码：`src/layer3_business_rules_builder.py`、`src/rules/variables.py`、`src/rules/actions.py`
+- 数据来源：
+  - 静态抽取：把 Layer 2 的 extraction 逐项转行，字段包含 FieldName/Category/Level/PatternKeywords/PatternRegex/Citation/Source（src/layer3_business_rules_builder.py:228‑252）
+  - 动态规则：读取 excels/<domain> 下的 .csv/.xlsx（简化版占位，后续可替换为 pandas/openpyxl）（src/layer3_business_rules_builder.py:254‑273）
+- 冲突消解：按 FieldName|Category 合并，较小 Priority 优先，同级合并关键词/正则与条件/例外（src/layer3_business_rules_builder.py:34‑88）
+- 生成两类规则：
+  - 分类规则：根据 FieldName 包含的关键词，设置 category_path 与分类规则 ID（src/layer3_business_rules_builder.py:91‑131）
+  - 分级规则：同时命中“字段名关键词”与“值文本正则”，设置分级与审计（src/layer3_business_rules_builder.py:133‑181）
+- 输出：
+  - rules/<domain>/categorization_rules.json
+  - rules/<domain>/classification_rules.json
+  - rules/<domain>/export_rule_data.json（用于前端构建规则 UI 的变量/动作定义）
+- 入口：src/layer3_business_rules_builder.py:213‑294
 
-### LLM 客户端与示例提示
+Layer 4 ｜运行时分类与分级（Excel 批处理）
 
-- 客户端：ZhipuAI SDK（GLM 4.6）`src/llm_client.py`
-- 示例提示：`src/prompt_examples.py`（为金融域提供骨架与“最小 item”示例）
+- 功能：把一份包含“字段名/分类路径（可空）/字段样本”的 Excel，跑过分类与分级规则，输出四列结果
+- 列识别：自动匹配列名，优先中文表头；兼容多种变体（src/layer4_classifier.py:36‑51）
+- 两阶段执行：
+  - 阶段 1（分类）：根据字段名关键词设置 category_path（src/rules/actions.py:33‑36）；可选“命中即停”
+  - 阶段 2（分级）：匹配字段名关键词 + 值文本正则，写入 result_level、result_rule_id，并追加审计（src/rules/actions.py:9‑26,27‑31）
+- 输出：在 outputs/<domain>/ 下生成同名 .classified.xlsx，附加列：分类路径/分级/规则 ID/审计（src/layer4_classifier.py:93‑160,161‑169）
+- 命令：
+  - 单文件：python src/layer4_classifier.py <domain> --input <xlsx> [--category "默认分类路径"] [--stop-first true] [--sheet Sheet1]
+  - 目录批量（测试用）：python src/layer4_classifier.py <domain>
 
-### 读取与转换依赖
+LLM 客户端与示例提示
 
-- PDF 读取：`pdfplumber`
-- Word 转换：优先 `docx2pdf`；Windows 平台可回退 `pywin32`（Word COM）
-- 不使用 `unoconv`
+- 客户端：ZhipuAI SDK（GLM 4.6），带并发控制与重试退避（src/llm_client.py:8‑10,11‑42）
+- 示例提示：
+  - Layer 1 示例 taxonomy/glossary（src/prompt_examples.py:1‑163）
+  - Layer 2 示例 extraction（src/prompt_examples.py:165‑280）
 
-## 运行流程
+依赖与配置
 
-1. 准备指南文件：将对应领域的指南放入 `guide/<domain>/`（支持 `*.pdf`、`*.docx`、`*.doc`）
-2. 配置动态规则：将 Excel 规则放入 `excels/<domain>/`
-3. 按顺序运行以下脚本：
-   - `python src/layer1_reader.py`
-   - `python src/layer1_5_catalog.py`（可选，根据是否需要跨文档目录聚合）
-   - `python src/layer2_extractor.py`
-   - `python src/layer2_5_normalize_items.py`
-   - `python src/layer3_business_rules_builder.py`
+- 第三方库：pdfplumber、zhipuai、openpyxl、tqdm、business‑rules
+- 关键配置文件（可选）：
+  - config/domains.json（文件名到领域的映射；环境变量 DOMAINS_CONFIG 可重写，src/domains.py:8‑36,39‑48）
+  - config/layer2_keywords.json（通用/域内关键词；环境变量 L2_KEYWORDS_CONFIG 可重写，src/layer2_extractor.py:11‑56,58）
+  - config/layer2_params.json（并发/批量/片段限制；环境变量 L2_PARAMS_CONFIG 可重写，src/layer2_extractor.py:61‑87）
+  - config/layer2_grouping.json（路径分桶深度与 token 深度；环境变量 L2_GROUPING_CONFIG 可重写，src/layer2_extractor.py:116‑131）
+- LLM 环境变量：
+  - GLM_API_KEY 或 ZHIPUAI_API_KEY（必需）
+  - GLM_MODEL（默认 glm‑4.6）
+  - LLM_CONCURRENCY（并发信号量，默认 2）
+  - LLM_RETRY / LLM_BACKOFF_SEC（重试次数与退避基线）
 
-## 产物目录
+运行流程（建议顺序）
 
-- 骨架与术语：`artifacts/<domain>/<doc>.taxonomy.json`、`artifacts/<domain>/<doc>.glossary.json`
-- 路径 seeds 与片段：`artifacts/<domain>/<doc>.taxonomy_seeds.json`、`artifacts/<domain>/<doc>.fragments.json`
-- 抽取明细：`artifacts/<domain>/<doc>.extraction.detailed.json`
-- 归一化项：`artifacts/<domain>/<doc>.items.normalized.json`
-- business-rules 规则：`rules/<domain>/rules.json`、`rules/<domain>/export_rule_data.json`
+1. 准备指南：把对应领域的指南放到 guide/<domain>/ 下（支持 pdf/docx/doc）
+2. 运行 Layer 1：python src/layer1_reader.py
+3. 可选 Layer 1.5（跨文档目录聚合）：python src/layer1_5_catalog.py
+4. 运行 Layer 2：python src/layer2_extractor.py [<domain>]
+5. 运行 Layer 2.5：python src/layer2_5_normalize_items.py
+6. 运行 Layer 3：python src/layer3_business_rules_builder.py
+7. 运行 Layer 4（可选，对 Excel 样本做分类分级）：python src/layer4_classifier.py <domain> --input <xlsx>
 
-## 后续需要实现的功能
+产物目录（更新版）
 
-- 补充多领域（交通、政务、气象等）的 Layer 2 最小 item 示例（如：车牌号/司机编号/户籍号/税号）。
-- Layer 1 增加“目录页提取与标题行过滤”的可配置词表，并按域自动选择关键词。
-- Layer 2 引入分组级缓存与失败重试，提升大文档稳定性与速度。
-- Layer 3 支持 `.xlsx` 决策表生成与运行时样例。
-- 评估与审计：
+- 骨架与术语：artifacts/<domain>/<doc>.taxonomy.json、artifacts/<domain>/<doc>.glossary.json
+- 路径 seeds 与片段：artifacts/<domain>/<doc>.taxonomy_seeds.json、artifacts/<domain>/<doc>.fragments.json
+- 域内合并：artifacts/<domain>/taxonomy.merged.json、artifacts/<domain>/taxonomy_seeds.merged.json
+- 抽取明细：artifacts/<domain>/<base>.extraction.detailed.json
+- 归一化项：artifacts/<domain>/<base>.items.normalized.json
+- 规则文件：rules/<domain>/categorization_rules.json、rules/<domain>/classification_rules.json、rules/<domain>/export_rule_data.json
+- 分类分级输出：outputs/<domain>/<file>.classified.xlsx
 
-  - 覆盖率、证据存在率、冲突一致率的统计脚本；
-  - 报告导出（`classification_results.json`、`audit_report.json`）。
+设计亮点（为什么这样做）
 
-- 用 langchain 进行拼接，或者 langgraph 进行额外的专家审议，更加严格和标准
-- 加入前端设计，可以上传指南或者 agent 联网搜索指定领域，动态规则设计完成。前端在第一步上传指南时，需要选择领域以及输入标准号
-- 在模版中间卡一下，可以生成一个模版供参考。如果完全考虑不到的内容是否可以只到四级分类。因为目的是对字段进行分类
-- l3 需要补充规则的具体内容，正则和关键词
+- 以“路径”为最小上下文单位：大模型抽取时只看相关片段，降低幻觉并提升可追溯性
+- 两阶段规则：先把“归类”做稳，再在分类上下文里做“分级”，易审计与调参
+- 术语归一：把“字段名口径”提前统一，后续规则更稳定
+- 表格直解析优先：节省 token 与成本；必要时才回退 LLM
 
-- 测试交科院给的数据，并进行效果评估，生成评估报告
+后续路线
 
-## 目录索引（关键文件）
-
-- `src/layer1_reader.py`｜知识层骨架与 seeds/fragments 生成
-- `src/layer1_5_catalog.py`｜域内目录聚合
-- `src/layer2_extractor.py`｜分组并行抽取，路径级证据 + 多 item
-- `src/layer2_5_normalize_items.py`｜同义归一与扁平化
-- `src/layer3_business_rules_builder.py`｜合并生成 business-rules 规则集
-- `src/rules/variables.py`｜规则变量定义
-- `src/rules/actions.py`｜规则动作定义
-- `src/llm_client.py`｜ GLM 客户端
-- `src/prompt_examples.py`｜少样本示例
+- Layer 1 目录词表可配置；域关键词自动选择
+- Layer 2 分组级缓存与失败重试，提升稳定性与速度
+- Layer 3 支持 xlsx 决策表生成与更完善的动态规则管道
+- 评估与审计脚本：覆盖率/证据存在率/冲突一致率，以及报告导出
+- 前端上传指南与规则设计 UI；支持 agent 联网获取领域指南
