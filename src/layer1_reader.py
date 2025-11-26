@@ -1,6 +1,5 @@
 import json
 import os
-import re
 from typing import Dict, List
 
 from pdf_plumber_text import read_pdf_plumber_text
@@ -8,16 +7,9 @@ from convert_to_pdf import convert_docx_to_pdf, convert_doc_to_pdf
 from llm_client import chat
 from prompt_examples import get_layer1_examples
 from domains import detect_domain
-from layer1_table_parser import build_taxonomy_from_tables, build_pre_extracted_items
 
 
-def join_pages(pages: List[str]) -> str:
-    return "\n\n".join(pages)
-
-
-def clean_cell_text(s: str) -> str:
-    """清理表格单元格内容：去掉换行、多余空格"""
-    return re.sub(r"\s+", " ", s or "").strip()
+ 
 
 
 def extract_taxonomy_and_glossary(text: str, source: str, domain: str) -> Dict:
@@ -56,8 +48,6 @@ def extract_taxonomy_and_glossary(text: str, source: str, domain: str) -> Dict:
         "所有术语必须来自原文；synonyms 若无同义词则必须返回空数组。"
         "【输出要求】"
         "禁止输出任何非 JSON 内容。"
-        "最终输出必须是严格合法 JSON。"
-        "若输出 JSON 不合法（语法错误、缺少引号、包含多余文本等），必须自动修复并重新输出，直到完全合法为止。"
     )
 
     user = "来源:" + source + "\n\n" + text
@@ -92,41 +82,10 @@ def extract_taxonomy_and_glossary(text: str, source: str, domain: str) -> Dict:
     return obj
 
 
-def validate_taxonomy_with_llm(taxonomy: Dict, source: str, domain: str) -> Dict:
-    print(f"[DEBUG] 使用LLM校验并修复taxonomy结构")
-    system = (
-        "你是JSON结构校验与修复Agent。"
-        "输入包含taxonomy对象，可能存在层级缺失、键不规范或结构不一致。"
-        "请输出严格合法的JSON，仅包含: {taxonomy}，其中 taxonomy 顶层为 {levels_definition, tree}。"
-        "tree 节点必须统一为 {level: 数字>=1, name: 字符串, children: [可选]} 格式，深度不限；"
-        "若children不存在则去掉该键；禁止添加输入未出现的分类名称；仅允许修复结构，不得补齐空名称或强行填充缺失层级。"
-        "levels_definition 若不存在则返回空数组。"
-        "禁止输出任何非JSON内容。"
-    )
-    user = json.dumps(
-        {"domain": domain, "source": source, "taxonomy": taxonomy}, ensure_ascii=False
-    )
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user},
-    ]
-    content = chat(messages)
-    s = content.find("{")
-    e = content.rfind("}")
-    if s == -1 or e == -1:
-        print("[DEBUG] LLM未返回JSON，使用原taxonomy")
-        return taxonomy
-    json_str = content[s : e + 1]
-    try:
-        obj = json.loads(json_str)
-        fixed = obj.get("taxonomy") or taxonomy
-        return fixed
-    except Exception:
-        print("[DEBUG] 校验解析失败，使用原taxonomy")
-        return taxonomy
+ 
 
 
-def build_seeds(taxonomy: Dict, fragments: List[Dict]) -> Dict:
+def build_seeds(taxonomy: Dict) -> Dict:
     levels = taxonomy.get("levels_definition", [])
 
     def node_name(node: Dict) -> str:
@@ -218,71 +177,22 @@ def main():
             raise RuntimeError(f"不支持的文件类型: {ext}")
         print(f"[DEBUG] 读取到 {len(frags)} 段")
 
-        # 构建 fragments：保留结构化表格和原始标题/段落
-        fragments: List[Dict] = []
-        for f in frags:
-            if f.get("type") == "table":
-                headers = f.get("rows", [])[:1]
-                data_rows = f.get("rows", [])[1:] if f.get("rows") else []
-                fragments.append(
-                    {
-                        "type": "table",
-                        "page": f.get("page", 0),
-                        "headers": headers[0] if headers else [],
-                        "rows": data_rows,
-                        "fields": f.get("fields", []),
-                    }
-                )
-            else:
-                t = re.sub(r"\s+", " ", f.get("text") or "").strip()
-                if t:
-                    fragments.append(
-                        {
-                            "type": f.get("type"),
-                            "text": t,
-                            "level": f.get("level", ""),
-                            "page": f.get("page", 0),
-                        }
-                    )
+ 
 
-        # 先尝试基于表格直接解析，成功则跳过 LLM 与文本拼接
-        parsed = build_taxonomy_from_tables(frags)
-        pre_items = build_pre_extracted_items(
-            frags, domain, os.path.join("guide", os.path.basename(path))
-        )
         out_dir = os.path.join(root, "artifacts", domain)
         os.makedirs(out_dir, exist_ok=True)
         base = os.path.splitext(os.path.basename(path))[0].replace(" ", "_")
-        if pre_items.get("extraction"):
-            taxonomy = validate_taxonomy_with_llm(
-                parsed, os.path.join("guide", os.path.basename(path)), domain
-            )
-            glossary = []
-            print(f"[DEBUG] 直接使用表格解析的预抽取items，跳过LLM")
-            with open(
-                os.path.join(out_dir, f"{base}.items.pre_extracted.json"),
-                "w",
-                encoding="utf-8",
-            ) as f:
-                json.dump(pre_items, f, ensure_ascii=False, indent=2)
-            # 保存结构化表格以便审计
-            tables_only = [frag for frag in fragments if frag.get("type") == "table"]
-            with open(
-                os.path.join(out_dir, f"{base}.tables.json"), "w", encoding="utf-8"
-            ) as f:
-                json.dump({"tables": tables_only}, f, ensure_ascii=False, indent=2)
-        else:
-            text_segs = [
-                frag.get("text")
-                for frag in fragments
-                if frag.get("type") in ("title", "paragraph")
-            ]
-            final_text = "\n\n".join([seg for seg in text_segs if seg])
-            print(f"[DEBUG] 合并后文本长度: {len(final_text)} 字符")
-            obj = extract_taxonomy_and_glossary(final_text, path, domain)
-            taxonomy = obj.get("taxonomy", {})
-            glossary = obj.get("glossary", [])
-        seeds = build_seeds(taxonomy, fragments)
+        text_segs = [
+            f.get("text")
+            for f in frags
+            if f.get("type") in ("title", "paragraph")
+        ]
+        final_text = "\n\n".join([seg for seg in text_segs if seg])
+        print(f"[DEBUG] 合并后文本长度: {len(final_text)} 字符")
+        obj = extract_taxonomy_and_glossary(final_text, path, domain)
+        taxonomy = obj.get("taxonomy", {})
+        glossary = obj.get("glossary", [])
+        seeds = build_seeds(taxonomy)
 
         print(f"[DEBUG] 保存taxonomy.json...")
         with open(
@@ -306,7 +216,7 @@ def main():
         with open(
             os.path.join(out_dir, f"{base}.fragments.json"), "w", encoding="utf-8"
         ) as f:
-            json.dump(fragments, f, ensure_ascii=False, indent=2)
+            json.dump(frags, f, ensure_ascii=False, indent=2)
 
         print(f"[DEBUG] 文件处理完成: {os.path.join(out_dir, f'{base}.taxonomy.json')}")
 

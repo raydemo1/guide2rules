@@ -189,24 +189,10 @@ def _build_user_payload_for_extraction(domain: str, seeds: Dict, fragments: List
     return json.dumps({"domain": domain, "seeds": seeds, "fragments": fragments}, ensure_ascii=False)
 
 
-def _build_system_prompt_for_pre_items() -> str:
-    return (
-        "你是数据分类分级抽取器Agent。系统已提供每个路径下的最小数据项名称(items)。"
-        "请为每个item生成分级(level: Sx 或 Sx-n)与匹配信息 patterns:{keywords[], regex[]}。"
-        "路径为可变层级数组 path:[seg1,seg2,...]，按指南实际深度返回，允许3–5层，不得填充或复制末级。"
-        "输出严格JSON: {domain, source, extraction}，其中 extraction 每项结构为:"
-        "{path:[seg1,seg2,...], items:[{name, level, patterns:{keywords[], regex[]}}]}。"
-        "禁止输出非JSON。"
-    )
+ 
 
 
-def _build_user_payload_for_pre_items(domain: str, source: str, pre: Dict, fragments: List[Dict]) -> str:
-    extraction_stub = []
-    for it in pre.get("extraction", []) or []:
-        path = it.get("path", {})
-        names = [sub.get("name") for sub in it.get("items", []) or [] if sub.get("name")]
-        extraction_stub.append({"path": path, "items": names})
-    return json.dumps({"domain": domain, "source": source, "extraction": extraction_stub, "fragments": fragments}, ensure_ascii=False)
+ 
 
 
 def _build_messages(system: str, user: str, domain: str, with_examples: bool) -> List[Dict]:
@@ -257,22 +243,7 @@ def extract_structured(
     return _call_llm_and_parse(messages, domain, source)
 
 
-def augment_levels_patterns_for_pre_items(
-    pre: Dict, fragments: List[Dict], domain: str
-) -> Dict:
-    print(f"[DEBUG] 基于预抽取items补全分级与匹配信息")
-    source = pre.get("source", "")
-    extraction_stub = []
-    for it in pre.get("extraction", []) or []:
-        path = it.get("path", {})
-        names = [
-            sub.get("name") for sub in it.get("items", []) or [] if sub.get("name")
-        ]
-        extraction_stub.append({"path": path, "items": names})
-    system = _build_system_prompt_for_pre_items()
-    user = _build_user_payload_for_pre_items(domain, source, pre, fragments)
-    messages = _build_messages(system, user, domain, with_examples=False)
-    return _call_llm_and_parse(messages, domain, source)
+ 
 
 
 def run_for_artifact_dir(artifact_dir: str, base: str, domain: str):
@@ -297,31 +268,12 @@ def run_for_artifact_dir(artifact_dir: str, base: str, domain: str):
             except Exception:
                 pass
         frags_path = None
-        pre_items_path = os.path.join(artifact_dir, "items.pre_extracted.merged.json")
     else:
         reviewed = os.path.join(artifact_dir, f"{base}.taxonomy_seeds.reviewed.json")
         seeds_path = reviewed if os.path.exists(reviewed) else os.path.join(artifact_dir, f"{base}.taxonomy_seeds.json")
         frags_path = os.path.join(artifact_dir, f"{base}.fragments.json")
-        pre_items_path = os.path.join(artifact_dir, f"{base}.items.pre_extracted.json")
 
-    if os.path.exists(pre_items_path):
-        print(f"[DEBUG] 检测到预抽取items，补全分级与匹配信息：{pre_items_path}")
-        with open(pre_items_path, "r", encoding="utf-8") as f:
-            pre = json.load(f)
-        # 读取 fragments 以便上下文匹配
-        if base.endswith(".merged"):
-            fragments = merged_frags
-            print(f"[DEBUG] 使用合并片段，共 {len(fragments)} 条")
-        else:
-            print(f"[DEBUG] 读取片段文件: {frags_path}")
-            with open(frags_path, "r", encoding="utf-8") as f:
-                fragments = json.load(f)
-        augmented = augment_levels_patterns_for_pre_items(pre, fragments, domain)
-        out_path = os.path.join(artifact_dir, f"{base}.extraction.detailed.json")
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(augmented, f, ensure_ascii=False, indent=2)
-        print(f"[DEBUG] 已生成补全后的抽取: {out_path}")
-        return
+    # 统一走LLM抽取路径，不再读取预抽取items
 
     print(f"[DEBUG] 读取种子文件: {seeds_path}")
     with open(seeds_path, "r", encoding="utf-8") as f:
