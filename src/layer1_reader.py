@@ -9,49 +9,106 @@ from prompt_examples import get_layer1_examples
 from domains import detect_domain
 
 
- 
+def _load_gbt_template() -> str:
+    override = os.environ.get("GBT_TEMPLATE_CONFIG") or ""
+    root = os.path.dirname(os.path.dirname(__file__))
+    cfg_path = (
+        override if override else os.path.join(root, "config", "gbt_template.json")
+    )
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            print(f"[DEBUG] 加载初始模板配置: {cfg_path}")
+            return json.dumps(data, ensure_ascii=False)
+    except Exception:
+        return ""
 
 
-def extract_taxonomy_and_glossary(text: str, source: str, domain: str) -> Dict:
-    print(f"[DEBUG] 开始提取分类体系和术语表")
+def _load_category_aliases() -> str:
+    override = os.environ.get("GBT_CATEGORY_ALIASES") or ""
+    root = os.path.dirname(os.path.dirname(__file__))
+    cfg_path = (
+        override
+        if override
+        else os.path.join(root, "config", "gbt_category_aliases.json")
+    )
+    try:
+        if os.path.exists(cfg_path):
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return json.dumps(data, ensure_ascii=False)
+    except Exception:
+        return ""
+    return ""
+
+
+def _load_domain_overrides(domain: str) -> str:
+    override = os.environ.get("DOMAIN_TEMPLATE_OVERRIDES") or ""
+    root = os.path.dirname(os.path.dirname(__file__))
+    default_path = os.path.join(
+        root, "config", "domain_template_overrides", f"{domain}.json"
+    )
+    cfg_path = override if override else default_path
+    try:
+        if os.path.exists(cfg_path):
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return json.dumps(data, ensure_ascii=False)
+    except Exception:
+        return ""
+    return ""
+
+
+def extract_taxonomy(text: str, source: str, domain: str) -> Dict:
+    print(f"[DEBUG] 开始提取分类分级体系")
     print(f"[DEBUG] 来源: {source}")
     print(f"[DEBUG] 域名: {domain}")
 
     system = (
-        "你是“数据分类分级知识层 Agent”。请基于指南文本提炼领域的分级体系（如有，级别格式统一为 S+数字，例如 S1、S2、S3…；"
+        "你是数据分类分级知识层 Agent。以输入的模板为骨架组织分类，结合指南文本生成 taxonomy。"
+        "等级格式统一为 S+数字（S1/S2…），若存在子级使用 Sx-1、Sx-2…；S1 为最低级，数字越大重要性越高。"
+        "【输出键】仅返回严格 JSON，包含: taxonomy。"
+        "【taxonomy 要求】顶层为 {levels_definition, tree}；tree 必须遵循模板层级 {level,name,children?,items?}。"
+        "1) levels_definition："
         "若某一级包含子级，则使用 Sx-1、Sx-2、Sx-3…；S1 始终代表最低级，数字越大重要性越高；"
         "等级数量由指南文本真实出现的等级数量决定，不得自行增删）。"
-        "并提炼分类体系（如有）与术语表。"
-        "仅返回严格 JSON，键包含: taxonomy, glossary。"
-        "【taxonomy 要求】"
-        "taxonomy 顶层结构必须为：{levels_definition, tree}。"
-        "1. 在 levels_definition 中："
         "若指南未提供分级体系，则 levels_definition 返回空数组。"
         "若指南提供分级体系，必须严格按照原文出现顺序逐条提取等级。"
         "若某个等级包含子等级（如“一般数据”下含“一般3级/2级/1级”），则编号为 Sx-1、Sx-2、Sx-3…（顺序依原文）。"
         "每个等级项格式固定为："
         "{code: 'Sx 或 Sx-y', description: '原文定义或空字符串', sublevels: [...] }。"
         "若无子级则去掉sublevels 。"
-        "2. tree 表示分类体系（如存在）。"
-        "若指南未提供分类体系，则 tree 返回空数组。"
-        "若指南提供分类体系："
-        "—— 分类层级数量必须与指南文本实际结构一致，可为任意深度。"
-        "—— 不得强制补齐到最深层级；不得为缺失层级填充空名称。"
-        "—— 每个分类节点必须包含 {level: 数字, name: 名称, children: [...]}；level 从 1 开始逐级递增，深度不限。"
-        "—— 节点结构示例：{level:1, name:'基础设施', children:[ {level:2, name:'公路交通基础设施', children:[ ... ]} ]}。"
-        "若指南文本中已经给出最小颗粒度字段（items，例如字段名、字段代码、具体数据项），"
-        "则允许在最底层增加 'items': ['item1', 'item2', ...] 字段，用于保留原始字段。"
-        "若指南未给出字段名，则不得创建 items。"
-        "tree 中除 items 外不得包含示例值或额外属性。"
-        "【glossary 要求】"
-        "glossary 为 List[{term, definition, synonyms}]。"
-        "所有术语必须来自原文；synonyms 若无同义词则必须返回空数组。"
-        "【输出要求】"
-        "禁止输出任何非 JSON 内容。"
+        "2) tree（如有分类体系）：以初始模板为基础进行填入和扩充，禁止采用指南中的分类框架，允许新增一级/二级分类或删除不相关分支；只在叶子放 items。"
+        "节点必须为 {level, name, children?}；不得为缺失层级填充空名称。"
+        "【敏感数据与可识别性】仅收录 GB/T 43697-2024 敏感数据；号码/账号/代码类必须给正则；文本型敏感数据需稳定关键词与语义。"
+        "items 使用规范名并去重，同义词归一；模板已有 items 不得重复。"
+        "【领域扩展/裁剪】若输入提供 domain_extension_hints（如车联网：新增 '车联网业务数据' 一级及其二级），按提示扩展；无关分支可裁剪并在审计记录。"
+        "【别名映射】可使用 category_aliases 将原文类别名映射到模板标准名；无法映射时插入最相近父节点。"
+        "【输出要求】禁止非 JSON；输出严格合法 JSON。"
     )
+    tpl = _load_gbt_template()
+    if tpl:
+        system = (
+            system
+            + "【分类模板】请以此模板为骨架组织分类层级；模板已有 items 不要重复；允许在最相近父节点下适度扩展一级/二级/叶子最小项。模板: "
+            + tpl
+        )
 
-    user = "来源:" + source + "\n\n" + text
+    aliases = _load_category_aliases()
+    domain_overrides = _load_domain_overrides(domain)
+    payload = {
+        "domain": domain,
+        "source": source,
+        "template": json.loads(tpl) if tpl else {},
+        "category_aliases": json.loads(aliases) if aliases else {},
+        "domain_extension_hints": (
+            json.loads(domain_overrides) if domain_overrides else {}
+        ),
+        "guide_text": text,
+    }
 
+    user = json.dumps(payload, ensure_ascii=False)
+    print(f"[DEBUG] 用户请求长度: {len(user)} 字符")
     print(f"[DEBUG] 发送请求到LLM...")
     examples = get_layer1_examples(domain)
     messages = (
@@ -77,12 +134,8 @@ def extract_taxonomy_and_glossary(text: str, source: str, domain: str) -> Dict:
     print(
         f"[DEBUG] 分类体系包含 {len(obj.get('taxonomy', {}).get('categories', []))} 个分类"
     )
-    print(f"[DEBUG] 术语表包含 {len(obj.get('glossary', []))} 个术语")
 
-    return obj
-
-
- 
+    return obj["taxonomy"]
 
 
 def build_seeds(taxonomy: Dict) -> Dict:
@@ -122,6 +175,28 @@ def build_seeds(taxonomy: Dict) -> Dict:
             walk(root, [])
 
     return {"levels": levels, "paths": path_items}
+
+
+def _get_layer1_max_chars() -> int:
+    env_val = os.environ.get("LAYER1_MAX_CHARS") or ""
+    try:
+        v = int(env_val) if env_val else 0
+        if v > 0:
+            return v
+    except Exception:
+        pass
+    root = os.path.dirname(os.path.dirname(__file__))
+    cfg_path = os.path.join(root, "config", "layer1_params.json")
+    try:
+        if os.path.exists(cfg_path):
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                data = json.load(f) or {}
+                v = int(data.get("max_chars", 0) or 0)
+                if v > 0:
+                    return v
+    except Exception:
+        pass
+    return 200000
 
 
 def main():
@@ -177,21 +252,18 @@ def main():
             raise RuntimeError(f"不支持的文件类型: {ext}")
         print(f"[DEBUG] 读取到 {len(frags)} 段")
 
- 
-
         out_dir = os.path.join(root, "artifacts", domain)
         os.makedirs(out_dir, exist_ok=True)
         base = os.path.splitext(os.path.basename(path))[0].replace(" ", "_")
         text_segs = [
-            f.get("text")
-            for f in frags
-            if f.get("type") in ("title", "paragraph")
+            f.get("text") for f in frags if f.get("type") in ("title", "paragraph")
         ]
         final_text = "\n\n".join([seg for seg in text_segs if seg])
         print(f"[DEBUG] 合并后文本长度: {len(final_text)} 字符")
-        obj = extract_taxonomy_and_glossary(final_text, path, domain)
-        taxonomy = obj.get("taxonomy", {})
-        glossary = obj.get("glossary", [])
+        max_chars = _get_layer1_max_chars()
+        if len(final_text) > max_chars:
+            raise RuntimeError("合并文本长度超过200000字符")
+        taxonomy = extract_taxonomy(final_text, path, domain)
         seeds = build_seeds(taxonomy)
 
         print(f"[DEBUG] 保存taxonomy.json...")
@@ -199,12 +271,6 @@ def main():
             os.path.join(out_dir, f"{base}.taxonomy.json"), "w", encoding="utf-8"
         ) as f:
             json.dump(taxonomy, f, ensure_ascii=False, indent=2)
-
-        print(f"[DEBUG] 保存glossary.json...")
-        with open(
-            os.path.join(out_dir, f"{base}.glossary.json"), "w", encoding="utf-8"
-        ) as f:
-            json.dump(glossary, f, ensure_ascii=False, indent=2)
 
         print(f"[DEBUG] 保存taxonomy_seeds.json...")
         with open(

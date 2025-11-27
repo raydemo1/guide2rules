@@ -65,15 +65,6 @@ Layer 2 ｜抽取器（路径级证据 + 最小项枚举，并行）
 - 输出：artifacts/<domain>/<base>.extraction.detailed.json
 - 入口：src/layer2_extractor.py:420‑466；按域遍历，可用命令行指定域
 
-Layer 2.5 ｜数据项归一化（同义统一 + 扁平化）
-
-- 输入：_.extraction.detailed.json 与对应 _.glossary.json
-- 处理：
-  - 从术语表构造“synonym→canonical”映射（src/layer2_5_normalize_items.py:6‑35）
-  - 将 extraction.items 扁平化为记录：每条包含 path、item{name,canonical,patterns}、level、conditions/exceptions、共享 citation（src/layer2_5_normalize_items.py:37‑80）
-- 输出：artifacts/<domain>/<base>.items.normalized.json
-- 入口：src/layer2_5_normalize_items.py:83‑130
-
 Layer 3 ｜规则生成（分类 + 分级，两阶段执行）
 
 - 数据来源：
@@ -86,6 +77,7 @@ Layer 3 ｜规则生成（分类 + 分级，两阶段执行）
 - 输出：
   - rules/<domain>/categorization_rules.json
   - rules/<domain>/classification_rules.json
+  - rules/<domain>/unified_rules.json（统一后的可执行规则集合）
   - rules/<domain>/export_rule_data.json（用于前端构建规则 UI 的变量/动作定义）
 - 入口：src/layer3_business_rules_builder.py:213‑294
 
@@ -95,10 +87,10 @@ Layer 4 ｜运行时分类与分级（Excel 批处理）
 - 列识别：自动匹配列名，优先中文表头；兼容多种变体（src/layer4_classifier.py:36‑51）
 - 两阶段执行：
   - 阶段 1（分类）：根据字段名关键词设置 category_path（src/rules/actions.py:33‑36）；可选“命中即停”
-  - 阶段 2（分级）：匹配字段名关键词 + 值文本正则，写入 result_level、result_rule_id，并追加审计（src/rules/actions.py:9‑26,27‑31）
-- 输出：在 outputs/<domain>/ 下生成同名 .classified.xlsx，附加列：分类路径/分级/规则 ID/审计（src/layer4_classifier.py:93‑160,161‑169）
+  - 阶段 2（分级）：匹配字段名关键词 + 值文本正则，写入 result_level、result_rule_id、data_marker，并追加审计（src/rules/actions.py:9‑26,27‑31,60‑63）
+- 输出：在 outputs/<domain>/ 下生成同名 .classified.xlsx，附加列：按层级拆分的分类列、数据标识、分级、规则ID、置信度（src/layer4_classifier.py:163‑190）
 - 命令：
-  - 单文件：python src/layer4_classifier.py <domain> --input <xlsx> [--category "默认分类路径"] [--stop-first true] [--sheet Sheet1]
+  - 单文件：python src/layer4_classifier.py <domain> --input <xlsx> [--stop-first true] [--sheet Sheet1]
   - 目录批量（测试用）：python src/layer4_classifier.py <domain>
 
 LLM 客户端与示例提示
@@ -128,9 +120,8 @@ LLM 客户端与示例提示
 2. 运行 Layer 1：python src/layer1_reader.py
 3. 可选 Layer 1.5（跨文档目录聚合）：python src/layer1_5_catalog.py
 4. 运行 Layer 2：python src/layer2_extractor.py [<domain>]
-5. 运行 Layer 2.5：python src/layer2_5_normalize_items.py
-6. 运行 Layer 3：python src/layer3_business_rules_builder.py
-7. 运行 Layer 4（可选，对 Excel 样本做分类分级）：python src/layer4_classifier.py <domain> --input <xlsx>
+5. 运行 Layer 3：python src/layer3_business_rules_builder.py
+6. 运行 Layer 4（可选，对 Excel 样本做分类分级）：python src/layer4_classifier.py <domain> --input <xlsx>
 
 产物目录（更新版）
 
@@ -138,8 +129,15 @@ LLM 客户端与示例提示
 - 路径 seeds 与片段：artifacts/<domain>/<doc>.taxonomy_seeds.json、artifacts/<domain>/<doc>.fragments.json
 - 域内合并：artifacts/<domain>/taxonomy.merged.json、artifacts/<domain>/taxonomy_seeds.merged.json
 - 抽取明细：artifacts/<domain>/<base>.extraction.detailed.json
-- 归一化项：artifacts/<domain>/<base>.items.normalized.json
 - 规则文件：rules/<domain>/categorization_rules.json、rules/<domain>/classification_rules.json、rules/<domain>/export_rule_data.json
+- 规则文件：rules/<domain>/categorization_rules.json、rules/<domain>/classification_rules.json、rules/<domain>/unified_rules.json、rules/<domain>/export_rule_data.json
+
+版本更新
+
+- 新增 `rules/<domain>/unified_rules.json` 作为运行时统一规则输入
+- 运行时输出列更新：新增 `数据标识` 与 `置信度`，分类列按层级展开
+- 动作集新增 `set_data_marker` 用于写入字段标识
+- CLI 变更：`layer4_classifier.py` 移除 `--category`，保留 `--stop-first` 与 `--sheet`
 - 分类分级输出：outputs/<domain>/<file>.classified.xlsx
 
 设计亮点（为什么这样做）
@@ -156,3 +154,59 @@ LLM 客户端与示例提示
 - Layer 3 支持 xlsx 决策表生成与更完善的动态规则管道
 - 评估与审计脚本：覆盖率/证据存在率/冲突一致率，以及报告导出
 - 前端上传指南与规则设计 UI；支持 agent 联网获取领域指南
+
+规则制定有两个方案：
+
+- 方案 A：评分制（最推荐）
+
+对每条字段进行多源打分：
+
+来源 匹配类型 分值（示例）
+字段名 关键词 +0.5
+字段名 正则 +1.0
+字段注释 关键词 +0.7
+字段注释 正则 +1.0
+示例值 关键词 +1.0
+示例值 正则结构 +1.5
+
+然后根据得分判断：
+
+≥ 2.0 ⇒ 高可信分类（自动分类）
+
+1.0~2.0 ⇒ 中可信（需要模型辅助或人工确认）
+
+<1.0 ⇒ 低可信（大模型语义分类）
+
+✔ 好处：
+
+召回稳定
+
+容错率高
+
+可持续扩展规则
+
+自动化 + 人工辅助比例灵活
+
+这是银行、电信、政府项目常用的做法。
+
+- 方案 B：多层触发（“短路 OR”）
+
+按优先级从高到低：
+
+示例值正则匹配 → 立刻判定（如身份证、手机号）
+
+字段名强关键词命中 → 判定
+
+字段注释命中 → 判定
+
+都不命中 → 用大模型 / embedding 做最终分类
+
+✔ 好处：
+
+性能高
+
+判断速度快
+
+不需要复杂打分逻辑
+
+当你的字段结构较干净时，这是最好方案。

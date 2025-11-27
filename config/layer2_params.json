@@ -1,5 +1,5 @@
 {
-  "workers": 3,
+  "workers": 4,
   "batch_size": 20,
   "per_path_frag_limit": 3,
   "group_frag_limit": 12

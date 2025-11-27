@@ -1,5 +1,5 @@
 from business_rules.actions import BaseActions, rule_action
-from business_rules.fields import FIELD_TEXT
+from business_rules.fields import FIELD_TEXT, FIELD_NUMERIC
 
 
 class ClassificationActions(BaseActions):
@@ -37,3 +37,27 @@ class ClassificationActions(BaseActions):
     @rule_action(params={"rule_id": FIELD_TEXT})
     def set_category_rule_id(self, rule_id):
         self.obj["result_rule_id"] = rule_id
+
+    @rule_action(params={"value": FIELD_NUMERIC})
+    def add_score(self, value):
+        try:
+            cur = float(self.obj.get("score", 0) or 0)
+        except Exception:
+            cur = 0.0
+        try:
+            inc = float(value)
+        except Exception:
+            inc = 0.0
+        self.obj["score"] = cur + inc
+
+    @rule_action(params={"tag": FIELD_TEXT})
+    def add_hit(self, tag):
+        hits = self.obj.get("hits") or []
+        if tag and tag not in hits:
+            hits.append(tag)
+        self.obj["hits"] = hits
+
+    @rule_action(params={"marker": FIELD_TEXT})
+    def set_data_marker(self, marker):
+        if marker:
+            self.obj["data_marker"] = marker

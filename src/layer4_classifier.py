@@ -13,24 +13,14 @@ from rules.variables import ClassificationVariables
 from rules.actions import ClassificationActions
 
 
-def load_rules(domain: str, root: str) -> Dict[str, List[Dict]]:
-    """加载分类与分级规则并分开返回，支持两阶段执行"""
-    cat_path = os.path.join(root, "rules", domain, "categorization_rules.json")
-    cls_path = os.path.join(root, "rules", domain, "classification_rules.json")
-
-    cat_rules: List[Dict] = []
-    cls_rules: List[Dict] = []
-
-    if os.path.exists(cat_path):
-        with open(cat_path, "r", encoding="utf-8") as f:
-            cat_rules = json.load(f)
-
-    if os.path.exists(cls_path):
-        with open(cls_path, "r", encoding="utf-8") as f:
-            cls_rules = json.load(f)
-
-    print(f"[INFO] Loaded rules: categorization={len(cat_rules)}, classification={len(cls_rules)}, total={len(cat_rules)+len(cls_rules)}")
-    return {"cat": cat_rules, "cls": cls_rules}
+def load_rules(domain: str, root: str) -> List[Dict]:
+    path = os.path.join(root, "rules", domain, "unified_rules.json")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"unified_rules.json not found for domain {domain}")
+    with open(path, "r", encoding="utf-8") as f:
+        rules: List[Dict] = json.load(f)
+    print(f"[INFO] Loaded unified rules: count={len(rules)}")
+    return rules
 
 
 def detect_columns(headers: List[str]) -> Dict[str, int]:
@@ -42,12 +32,11 @@ def detect_columns(headers: List[str]) -> Dict[str, int]:
                 return hmap[k]
         return -1
 
-    # 字段注释即中文字段名；若无则回退至“字段名/字段名称/名称”
-    field_idx = find(["字段注释", "字段名", "FieldName", "字段名称", "名称"])
-    category_idx = find(["分类路径", "Category", "分类"])
-    # 字段样本仅对应数据示例
-    value_idx = find(["字段样本", "样本", "数据示例"])  # 兼容可能的表头变体
-    return {"field": field_idx, "category": category_idx, "value": value_idx}
+    field_en_idx = find(["字段名", "FieldName", "字段名称", "名称", "英文字段名"]) 
+    field_cn_idx = find(["字段注释", "中文字段名", "中文名称", "字段中文名"]) 
+    value_idx = find(["字段样本", "样本", "数据示例"])  
+    table_idx = find(["表名", "Table", "表名称"])  
+    return {"field_en": field_en_idx, "field_cn": field_cn_idx, "value": value_idx, "table": table_idx}
 
 
 def normalize_category(category: str) -> str:
@@ -61,16 +50,13 @@ def classify_rows(
     domain: str,
     in_path: str,
     out_path: str,
-    category_override: str,
     stop_first: bool,
     sheet_name: str,
 ):
     root = os.path.dirname(os.path.dirname(__file__))
     try:
-        rl = load_rules(domain, root)
-        cat_rules = rl.get("cat", [])
-        cls_rules = rl.get("cls", [])
-        print(f"[DEBUG] Loaded rules from {domain}: cat={len(cat_rules)}, cls={len(cls_rules)}")
+        unified_rules = load_rules(domain, root)
+        print(f"[DEBUG] Loaded unified rules from {domain}: {len(unified_rules)}")
     except Exception as e:
         print(f"[ERROR] Failed to load rules: {e}")
         return
@@ -90,73 +76,117 @@ def classify_rows(
     for row in ws.iter_rows(min_row=2):
         rows.append([c.value for c in row])
 
-    new_headers = headers + ["分类路径", "分级", "规则ID", "审计"]
-    out_wb = openpyxl.Workbook()
-    out_ws = out_wb.active
-    out_ws.title = ws.title
-    out_ws.append(new_headers)
-
+    processed = []
     total_rows = len(rows)
     matched_rows = 0
+
+    import re
+    def make_tokens(s: str) -> str:
+        parts = [p for p in re.split(r"[^A-Za-z]+|_+", (s or "").lower()) if p]
+        return " ".join(parts)
+
     for r in tqdm(rows, desc=f"[PROGRESS] {os.path.basename(in_path)}", unit="row"):
-        field_name = str((r[cols["field"]] if cols["field"] >= 0 else "") or "").strip()
-        if cols["category"] >= 0:
-            # 修复：不直接使用输入的分类，留给规则引擎处理
-            category = normalize_category(r[cols["category"]])
-        else:
-            category = normalize_category(category_override)
+        field_en = str((r[cols["field_en"]] if cols.get("field_en", -1) >= 0 else "") or "").strip()
+        field_cn = str((r[cols["field_cn"]] if cols.get("field_cn", -1) >= 0 else "") or "").strip()
+        field_name = field_en
+        field_comment = field_cn or field_en
+        table_name = (
+            str(r[cols["table"]]) if cols.get("table", -1) >= 0 and r[cols["table"]] is not None else ws.title
+        )
+        category = ""
+        value_text = str(r[cols["value"]]) if cols["value"] >= 0 and r[cols["value"]] is not None else ""
 
-        # 仅使用“字段样本”作为数据示例；缺失则为空
-        if cols["value"] >= 0:
-            v = r[cols["value"]]
-            value_text = str(v) if v is not None else ""
-        else:
-            value_text = ""
-
-        # 关键修复：创建变量对象时，category_path使用输入值（规则会覆盖）
         obj = {
             "field_name": field_name,
-            "category_path": category,  # 规则执行后会覆盖
+            "field_comment": field_comment,
+            "table_name": table_name,
+            "field_tokens": make_tokens(field_name),
+            "table_tokens": make_tokens(table_name),
+            "category_path": category,
             "value_text": value_text,
+            "score": 0,
         }
-
         vars_obj = ClassificationVariables(obj)
         acts_obj = ClassificationActions(obj)
 
-        # 阶段1：仅分类
-        if cat_rules:
-            run_all(
-                rule_list=cat_rules,
-                defined_variables=vars_obj,
-                defined_actions=acts_obj,
-                stop_on_first_trigger=bool(stop_first),
-            )
+        score_rules = []
+        decision_rules = []
+        for rule in unified_rules:
+            acts = rule.get("actions", []) or []
+            if any(a.get("name") == "add_score" for a in acts):
+                score_rules.append(rule)
+            if any(a.get("name") == "set_classification" for a in acts):
+                decision_rules.append(rule)
 
-        # 阶段2：仅分级（依赖已写入的 category_path）
-        if cls_rules:
-            run_all(
-                rule_list=cls_rules,
-                defined_variables=vars_obj,
-                defined_actions=acts_obj,
-                stop_on_first_trigger=bool(stop_first),
-            )
+        run_all(
+            rule_list=score_rules,
+            defined_variables=vars_obj,
+            defined_actions=acts_obj,
+            stop_on_first_trigger=False,
+        )
+
+        def _is_high(rule):
+            for a in rule.get("actions", []) or []:
+                if a.get("name") == "set_classification":
+                    rid = str(a.get("params", {}).get("rule_id", ""))
+                    return rid.endswith("-H")
+            return False
+
+        decision_rules.sort(key=lambda r: (not _is_high(r)))
+
+        run_all(
+            rule_list=decision_rules,
+            defined_variables=vars_obj,
+            defined_actions=acts_obj,
+            stop_on_first_trigger=True,
+        )
 
         final_category = obj.get("category_path", "")
         level = obj.get("result_level", "")
         rid = obj.get("result_rule_id", "")
         audits = obj.get("audits", [])
-        audit_str = (
-            ";".join([json.dumps(a, ensure_ascii=False) for a in audits])
-            if audits
-            else ""
-        )
+        score = obj.get("score", 0)
+        marker = obj.get("data_marker", "")
+        audit_str = ";".join([json.dumps(a, ensure_ascii=False) for a in audits]) if audits else ""
 
-        # 统计匹配情况：若分类路径发生变化，或产生分级/规则ID，则视为命中规则
-        if (final_category and final_category != category) or level or rid:
+        if final_category or level or rid:
             matched_rows += 1
 
-        # 修复：输出规则执行后的分类路径
-        out_ws.append([*r, final_category, level, rid, audit_str])
+        processed.append({"row": r, "category": final_category, "level": level, "rid": rid, "audit": audit_str, "score": score, "marker": marker})
+
+    max_depth = 0
+    for p in processed:
+        parts = [x for x in str(p["category"]).split("/") if x]
+        if len(parts) > max_depth:
+            max_depth = len(parts)
+
+    cat_headers = [f"{i}级分类" for i in range(1, max_depth + 1)]
+    new_headers = headers + cat_headers + ["数据标识", "分级", "规则ID", "置信度"]
+    out_wb = openpyxl.Workbook()
+    out_ws = out_wb.active
+    out_ws.title = ws.title
+    out_ws.append(new_headers)
+
+    for p in processed:
+        parts = [x for x in str(p["category"]).split("/") if x]
+        rid = str(p.get("rid", "") or "")
+        if rid.endswith("-H"):
+            conf = "high"
+        elif rid.endswith("-M"):
+            conf = "medium"
+        else:
+            conf = "low"
+
+        if conf == "low":
+            cat_cols = [""] * max_depth
+            level = ""
+            rid = ""
+        else:
+            cat_cols = parts + ([""] * (max_depth - len(parts)))
+            level = p["level"]
+            rid = p["rid"]
+
+        out_ws.append([*p["row"], *cat_cols, p.get("marker", ""), level, rid, conf])
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     out_wb.save(out_path)
@@ -164,15 +194,12 @@ def classify_rows(
 
     # 末尾调试统计信息
     ratio = (matched_rows / total_rows) if total_rows > 0 else 0.0
-    print(
-        f"[INFO] Stats: total_rows={total_rows}, matched_rows={matched_rows}, matched_ratio={ratio:.2%}"
-    )
+    print(f"[INFO] Stats: total_rows={total_rows}, matched_rows={matched_rows}, matched_ratio={ratio:.2%}")
 
 
 def process_domain(
     domain: str,
     input_file: str,
-    category_override: str,
     stop_first: bool,
     sheet_name: str,
 ):
@@ -182,7 +209,7 @@ def process_domain(
         out_dir = os.path.join(root, "outputs", domain)
         out_path = os.path.join(out_dir, base + ".classified.xlsx")
         classify_rows(
-            domain, input_file, out_path, category_override, stop_first, sheet_name
+            domain, input_file, out_path, stop_first, sheet_name
         )
         print(out_path)
         return
@@ -200,7 +227,7 @@ def process_domain(
         out_dir = os.path.join(root, "outputs", domain)
         out_path = os.path.join(out_dir, base + ".classified.xlsx")
         classify_rows(
-            domain, in_path, out_path, category_override, stop_first, sheet_name
+            domain, in_path, out_path, stop_first, sheet_name
         )
         print(out_path)
 
@@ -209,13 +236,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("domain")
     parser.add_argument("--input", dest="input", default=None)
-    parser.add_argument("--category", dest="category", default="")
     parser.add_argument("--stop-first", dest="stop_first", default="false")
     parser.add_argument("--sheet", dest="sheet", default="")
     args = parser.parse_args()
 
     stop_first = str(args.stop_first).lower() != "false"
-    process_domain(args.domain, args.input, args.category, stop_first, args.sheet)
+    process_domain(args.domain, args.input, stop_first, args.sheet)
 
 
 if __name__ == "__main__":

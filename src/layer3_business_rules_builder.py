@@ -181,6 +181,182 @@ def build_classification_rules(combined: List[Dict]) -> List[Dict]:
     return rules
 
 
+def build_unified_rules(combined: List[Dict]) -> List[Dict]:
+    rules: List[Dict] = []
+
+    for r in combined:
+        field = _norm(r.get("FieldName"))
+        category = _norm(r.get("Category"))
+        level = _norm(r.get("Level"))
+        citation = r.get("Citation", "")
+        source = r.get("Source", "")
+
+        if not field or not category or not level:
+            continue
+
+        # 关键词来源拆分：支持 cn/en，缺失时回退
+        kw_cn = []
+        kw_en = []
+        raw_kw = [
+            x.strip()
+            for x in (_norm(r.get("PatternKeywords")) or "").split(",")
+            if x.strip()
+        ]
+        # 简单判定：ASCII 纯字母视为英文，否则中文
+        for x in raw_kw:
+            if x and all("a" <= ch <= "z" or "A" <= ch <= "Z" for ch in x):
+                kw_en.append(x.lower())
+            else:
+                kw_cn.append(x.lower())
+
+        # 正则集合
+        rx = [x for x in (_norm(r.get("PatternRegex")) or "").split("||") if x]
+
+        rid_base = f"U-{field[:8]}-{level}"
+        item_tag = f"T-{field[:8]}-{level}"
+        generic_en = {
+            "id", "no", "num", "code",
+            "name", "nm", "first", "last", "username", "user",
+            "account", "acct", "acc", "key", "value", "data", "info",
+            "desc", "note", "text", "content", "status", "type", "flag",
+            "lat", "lng", "lon", "long", "loc", "location"
+        }
+
+        # 加分规则：表名/字段名英文关键词 +0.5
+        for kw in sorted(set(kw_en)):
+            val = 0.2 if kw in generic_en else 0.5
+            tag_type = "GEN_EN" if kw in generic_en else "KW_EN"
+            rules.append({
+                "conditions": {"any": [
+                    {"name": "table_tokens", "operator": "contains", "value": kw},
+                    {"name": "field_tokens", "operator": "contains", "value": kw},
+                ]},
+                "actions": [
+                    {"name": "add_score", "params": {"value": val}},
+                    {"name": "add_hit", "params": {"tag": item_tag}},
+                    {"name": "add_hit", "params": {"tag": tag_type}},
+                ],
+            })
+
+        for kw in sorted(set(kw_en)):
+            val = 0.2 if kw in generic_en else 0.5
+            tag_type = "GEN_EN" if kw in generic_en else "KW_EN"
+            rules.append({
+                "conditions": {"any": [
+                    {"name": "table_name", "operator": "contains", "value": kw},
+                    {"name": "field_name", "operator": "contains", "value": kw},
+                ]},
+                "actions": [
+                    {"name": "add_score", "params": {"value": val}},
+                    {"name": "add_hit", "params": {"tag": item_tag}},
+                    {"name": "add_hit", "params": {"tag": tag_type}},
+                ],
+            })
+
+        # 加分规则：字段注释中文关键词 +1.5
+        for kw in sorted(set(kw_cn)):
+            rules.append({
+                "conditions": {"any": [
+                    {"name": "field_comment", "operator": "contains", "value": kw},
+                ]},
+                "actions": [
+                    {"name": "add_score", "params": {"value": 1.5}},
+                    {"name": "add_hit", "params": {"tag": item_tag}},
+                    {"name": "add_hit", "params": {"tag": "KW_CN"}},
+                ],
+            })
+
+        # 加分规则：示例值关键词 +1.0
+        for kw in sorted(set(kw_cn + kw_en)):
+            rules.append({
+                "conditions": {"any": [
+                    {"name": "value_text", "operator": "contains", "value": kw},
+                ]},
+                "actions": [
+                    {"name": "add_score", "params": {"value": 1.0}},
+                    {"name": "add_hit", "params": {"tag": item_tag}},
+                    {"name": "add_hit", "params": {"tag": "VAL_KW"}},
+                ],
+            })
+
+        # 加分规则：示例值正则 +2.0（过滤非法正则）
+        import re
+        for rxp in sorted(set(rx)):
+            try:
+                re.compile(rxp)
+            except Exception:
+                continue
+            rules.append({
+                "conditions": {"any": [
+                    {"name": "value_text", "operator": "matches_regex", "value": rxp},
+                ]},
+                "actions": [
+                    {"name": "add_score", "params": {"value": 2.0}},
+                    {"name": "add_hit", "params": {"tag": item_tag}},
+                    {"name": "add_hit", "params": {"tag": "VAL_RX"}},
+                ],
+            })
+
+        # 决策规则：高可信 ≥2.0 → 写入分类与分级
+        rules.append({
+            "conditions": {"all": [
+                {"name": "score", "operator": "greater_than_or_equal_to", "value": 2.0},
+                {"any": [
+                    {"name": "hit_tags", "operator": "contains", "value": item_tag},
+                ]},
+                {"any": [
+                    {"name": "hit_tags", "operator": "contains", "value": "VAL_RX"},
+                    {"name": "hit_tags", "operator": "contains", "value": "KW_CN"},
+                ]},
+            ]},
+            "actions": [
+                {"name": "set_suggested_category", "params": {"category": category}},
+                {"name": "set_classification", "params": {"level": level, "rule_id": f"{rid_base}-H"}},
+                {"name": "set_data_marker", "params": {"marker": field}},
+            ],
+        })
+
+        # 决策规则：中可信 1.0 ≤ score < 2.0 → 写入分类与分级
+        rules.append({
+            "conditions": {"all": [
+                {"name": "score", "operator": "greater_than_or_equal_to", "value": 1.0},
+                {"name": "score", "operator": "less_than", "value": 2.0},
+                {"any": [
+                    {"name": "hit_tags", "operator": "contains", "value": item_tag},
+                ]},
+                {"any": [
+                    {"name": "hit_tags", "operator": "contains", "value": "KW_CN"},
+                    {"name": "hit_tags", "operator": "contains", "value": "KW_EN"},
+                    {"name": "hit_tags", "operator": "contains", "value": "VAL_KW"},
+                    {"name": "hit_tags", "operator": "contains", "value": "VAL_RX"},
+                ]},
+            ]},
+            "actions": [
+                {"name": "set_suggested_category", "params": {"category": category}},
+                {"name": "set_classification", "params": {"level": level, "rule_id": f"{rid_base}-M"}},
+                {"name": "set_data_marker", "params": {"marker": field}},
+            ],
+        })
+
+        # 低可信：<1.0 不写分类与分级（无需动作）
+
+    return rules
+
+
+def write_unified_rules(domain: str, root: str, unified_rules: List[Dict]):
+    out_dir = os.path.join(root, "rules", domain)
+    os.makedirs(out_dir, exist_ok=True)
+
+    uni_path = os.path.join(out_dir, "unified_rules.json")
+    with open(uni_path, "w", encoding="utf-8") as f:
+        json.dump(unified_rules, f, ensure_ascii=False, indent=2)
+
+    data = export_rule_data(ClassificationVariables, ClassificationActions)
+    with open(os.path.join(out_dir, "export_rule_data.json"), "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+    return uni_path
+
 def write_rules(
     domain: str,
     root: str,
@@ -233,8 +409,11 @@ def main():
                     category = "/".join([p for p in path if p])
 
                     for field in item.get("items", []):
-                        keywords = field.get("patterns", {}).get("keywords", [])
-                        regex = field.get("patterns", {}).get("regex", [])
+                        pats = field.get("patterns", {})
+                        cn = pats.get("keywords_cn", [])
+                        en = pats.get("keywords_en", [])
+                        keywords = list(set((cn or []) + (en or [])))
+                        regex = pats.get("regex", [])
 
                         static_rows.append(
                             {
@@ -275,19 +454,14 @@ def main():
         # 3. 合并规则并解决冲突
         combined = resolve_conflicts(static_rows + dynamic_rows)
 
-        # 4. 生成两类规则
-        categorization_rules = build_categorization_rules(combined)
-        classification_rules = build_classification_rules(combined)
+        # 4. 生成统一规则
+        unified_rules = build_unified_rules(combined)
 
-        # 5. 写入规则文件
-        cat_path, cls_path = write_rules(
-            domain, root, categorization_rules, classification_rules
-        )
+        # 5. 写入统一规则文件
+        uni_path = write_unified_rules(domain, root, unified_rules)
 
-        print(f"[{domain}] 分类规则生成: {cat_path}")
-        print(f"[{domain}] 分级规则生成: {cls_path}")
-        print(f"   - 分类规则数: {len(categorization_rules)}")
-        print(f"   - 分级规则数: {len(classification_rules)}\n")
+        print(f"[{domain}] 统一规则生成: {uni_path}")
+        print(f"   - 统一规则数: {len(unified_rules)}\n")
 
 
 if __name__ == "__main__":

@@ -86,9 +86,6 @@ def _load_params_config():
         }
 
 
- 
-
-
 def filter_fragments_for_group(
     paths: List[Dict],
     fragments: List[Dict],
@@ -176,29 +173,38 @@ def _call_llm_and_parse(messages: List[Dict], domain: str, source: str) -> Dict:
 def _build_system_prompt_for_extraction() -> str:
     return (
         "你是数据分类分级抽取器Agent。根据给定的路径与相关片段，"
-        "请为每个item生成分级(level: Sx 或 Sx-n)与匹配信息 patterns:{keywords[], regex[]}。"
-        "路径为可变层级数组 path:[seg1,seg2,...]，按指南实际深度返回，允许3–5层，不得填充或复制末级。"
+        "路径为可变层级数组 path:[seg1,seg2,...]，按路径的实际深度返回，允许3–5层，不得填充或复制末级。"
         "必须严格按输入 seeds.paths 的出现顺序返回 extraction 列表中的项，不得重排。"
+        "当某条路径的 seeds.items 为空或未提供时：允许在该叶子路径上基于片段与路径token推测合理的最小 item，"
+        "但必须满足可被规则引擎稳定匹配抽取（需要明确关键词与可行的正则），并且为不可再拆分的原子字段（例如号码/代码/ID）。"
+        "输出的 items 必须去重并使用规范名；关键词需双语：中文 keywords_cn 与英文/缩写 keywords_en；"
+        "regex 仅在唯一可识别的字段上提供，如身份证号、电话号码、邮箱、统一社会信用代码等，不要给出泛化或模糊的正则。关键词也必须在不同item间不得重复"
+        "请为每个item生成分级(level: Sx 或 Sx-n)与匹配信息 patterns:{keywords_cn[], keywords_en[], regex[]}。"
+        "英文关键词需统一为小写、常用字段名或缩写（如 number, addr, address, tel, phone, id, email 等），避免空格与过长短语。"
         "输出严格JSON: {domain, source, extraction}。extraction为列表，项结构:"
-        "{path:[seg1,seg2,...], citation:{page,text}, items:[{name, level, patterns:{keywords[], regex[]}}]}。"
+        "{path:[seg1,seg2,...], citation:{page,text}, items:[{name, level, patterns:{keywords_cn[], keywords_en[], regex[]}}]}。"
         "禁止输出非JSON。"
     )
 
 
-def _build_user_payload_for_extraction(domain: str, seeds: Dict, fragments: List[Dict]) -> str:
-    return json.dumps({"domain": domain, "seeds": seeds, "fragments": fragments}, ensure_ascii=False)
+def _build_user_payload_for_extraction(
+    domain: str, seeds: Dict, fragments: List[Dict]
+) -> str:
+    return json.dumps(
+        {"domain": domain, "seeds": seeds, "fragments": fragments}, ensure_ascii=False
+    )
 
 
- 
-
-
- 
-
-
-def _build_messages(system: str, user: str, domain: str, with_examples: bool) -> List[Dict]:
+def _build_messages(
+    system: str, user: str, domain: str, with_examples: bool
+) -> List[Dict]:
     if with_examples:
         examples = get_layer2_examples(domain)
-        return ([{"role": "system", "content": system}] + examples + [{"role": "user", "content": user}])
+        return (
+            [{"role": "system", "content": system}]
+            + examples
+            + [{"role": "user", "content": user}]
+        )
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
@@ -243,9 +249,6 @@ def extract_structured(
     return _call_llm_and_parse(messages, domain, source)
 
 
- 
-
-
 def run_for_artifact_dir(artifact_dir: str, base: str, domain: str):
     print(f"\n[DEBUG] Layer2 处理工件目录: {artifact_dir}")
     print(f"[DEBUG] 基础文件名: {base}")
@@ -253,12 +256,14 @@ def run_for_artifact_dir(artifact_dir: str, base: str, domain: str):
 
     if base.endswith(".merged"):
         reviewed = os.path.join(artifact_dir, "taxonomy_seeds.reviewed.json")
-        seeds_path = reviewed if os.path.exists(reviewed) else os.path.join(artifact_dir, "taxonomy_seeds.merged.json")
+        seeds_path = (
+            reviewed
+            if os.path.exists(reviewed)
+            else os.path.join(artifact_dir, "taxonomy_seeds.merged.json")
+        )
         # 合并所有 fragments 作为上下文
         frag_files = [
-            f
-            for f in os.listdir(artifact_dir)
-            if f.endswith(".fragments.json")
+            f for f in os.listdir(artifact_dir) if f.endswith(".fragments.json")
         ]
         merged_frags = []
         for ff in frag_files:
@@ -270,7 +275,11 @@ def run_for_artifact_dir(artifact_dir: str, base: str, domain: str):
         frags_path = None
     else:
         reviewed = os.path.join(artifact_dir, f"{base}.taxonomy_seeds.reviewed.json")
-        seeds_path = reviewed if os.path.exists(reviewed) else os.path.join(artifact_dir, f"{base}.taxonomy_seeds.json")
+        seeds_path = (
+            reviewed
+            if os.path.exists(reviewed)
+            else os.path.join(artifact_dir, f"{base}.taxonomy_seeds.json")
+        )
         frags_path = os.path.join(artifact_dir, f"{base}.fragments.json")
 
     # 统一走LLM抽取路径，不再读取预抽取items
@@ -287,61 +296,88 @@ def run_for_artifact_dir(artifact_dir: str, base: str, domain: str):
         with open(frags_path, "r", encoding="utf-8") as f:
             fragments = json.load(f)
 
-    source = "merged" if base.endswith(".merged") else os.path.join("guide", base + ".pdf")
+    source = (
+        "merged" if base.endswith(".merged") else os.path.join("guide", base + ".pdf")
+    )
 
     use_paths = bool(seeds.get("paths"))
     if not use_paths or not seeds.get("paths"):
         print(f"[DEBUG] seeds.paths 为空，已移除旧模式，跳过该文件")
         return
     else:
-        print(f"[DEBUG] 使用路径分组抽取（兼容可变层级）")
         params = _load_params_config()
         grouping = _load_grouping_config()
-        batch_size = params["batch_size"]
-        per_path_limit = params["per_path_frag_limit"]
-        group_limit = params["group_frag_limit"]
-        workers = params["workers"]
-        raw_paths = seeds.get("paths", [])
-        norm_paths = raw_paths
-        groups = group_paths_variable(
-            norm_paths, grouping.get("group_by_depth", 2), batch_size
-        )
-        print(
-            f"[DEBUG] 分成 {len(groups)} 组，每组最多 {batch_size} 条路径，并行度 {workers}"
+        batch_size = params.get("batch_size", 8)
+        per_path_limit = params.get("per_path_frag_limit", 6)
+        group_limit = params.get("group_frag_limit", 24)
+        workers = params.get("workers", 4)
+        llm_max_chars = params.get("llm_max_chars", 120000)
+
+        full_payload_len = len(
+            _build_user_payload_for_extraction(domain, seeds, fragments)
         )
         order_map = _make_order_map(seeds.get("paths", []))
-        all_items = []
-        with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
-            futures = []
-            for gi, group in enumerate(groups, 1):
-                mini_seeds = {"levels": seeds.get("levels", []), "paths": group}
-                frags = filter_fragments_for_group(
-                    group,
-                    fragments,
-                    domain,
-                    per_path_limit=per_path_limit,
-                    group_limit=group_limit,
-                )
-                futures.append(
-                    ex.submit(extract_structured, mini_seeds, frags, domain, source)
-                )
-            for fi, fut in enumerate(as_completed(futures), 1):
-                try:
-                    extraction = fut.result()
-                    items = extraction.get("extraction", [])
-                    items = _sort_items_by_order(items, order_map)
-                    print(f"[DEBUG] 并行分组 {fi}/{len(futures)} 抽取到 {len(items)} 项")
-                    all_items.extend(items)
-                except Exception as e:
-                    print(f"[DEBUG] 分组任务失败: {e}")
-        result_items = _sort_items_by_order(all_items, order_map)
-        result = {"domain": domain, "source": source, "extraction": result_items}
-        fname = f"{base}.extraction.detailed.json"
-        out_path = os.path.join(artifact_dir, fname)
-        print(f"[DEBUG] 保存抽取结果到: {out_path}")
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(result, f, ensure_ascii=False, indent=2)
-        print(f"[DEBUG] 抽取完成: {out_path}")
+
+        if full_payload_len <= llm_max_chars:
+            print(
+                f"[DEBUG] 输入总长度 {full_payload_len} ≤ 阈值 {llm_max_chars}，单批次抽取"
+            )
+            extraction = extract_structured(seeds, fragments, domain, source)
+            items = extraction.get("extraction", [])
+            result_items = _sort_items_by_order(items, order_map)
+            result = {"domain": domain, "source": source, "extraction": result_items}
+            fname = f"{base}.extraction.detailed.json"
+            out_path = os.path.join(artifact_dir, fname)
+            print(f"[DEBUG] 保存抽取结果到: {out_path}")
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(result, f, ensure_ascii=False, indent=2)
+            print(f"[DEBUG] 抽取完成: {out_path}")
+        else:
+            print(
+                f"[DEBUG] 输入总长度 {full_payload_len} > 阈值 {llm_max_chars}，按分组抽取"
+            )
+            raw_paths = seeds.get("paths", [])
+            norm_paths = raw_paths
+            groups = group_paths_variable(
+                norm_paths, grouping.get("group_by_depth", 2), batch_size
+            )
+            print(
+                f"[DEBUG] 分成 {len(groups)} 组，每组最多 {batch_size} 条路径，并行度 {workers}"
+            )
+            all_items = []
+            with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+                futures = []
+                for gi, group in enumerate(groups, 1):
+                    mini_seeds = {"levels": seeds.get("levels", []), "paths": group}
+                    frags = filter_fragments_for_group(
+                        group,
+                        fragments,
+                        domain,
+                        per_path_limit=per_path_limit,
+                        group_limit=group_limit,
+                    )
+                    futures.append(
+                        ex.submit(extract_structured, mini_seeds, frags, domain, source)
+                    )
+                for fi, fut in enumerate(as_completed(futures), 1):
+                    try:
+                        extraction = fut.result()
+                        items = extraction.get("extraction", [])
+                        items = _sort_items_by_order(items, order_map)
+                        print(
+                            f"[DEBUG] 并行分组 {fi}/{len(futures)} 抽取到 {len(items)} 项"
+                        )
+                        all_items.extend(items)
+                    except Exception as e:
+                        print(f"[DEBUG] 分组任务失败: {e}")
+            result_items = _sort_items_by_order(all_items, order_map)
+            result = {"domain": domain, "source": source, "extraction": result_items}
+            fname = f"{base}.extraction.detailed.json"
+            out_path = os.path.join(artifact_dir, fname)
+            print(f"[DEBUG] 保存抽取结果到: {out_path}")
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(result, f, ensure_ascii=False, indent=2)
+            print(f"[DEBUG] 抽取完成: {out_path}")
 
 
 def filter_fragments_for_path(
@@ -403,7 +439,9 @@ def main():
             run_for_artifact_dir(artifact_dir, "taxonomy_seeds.merged", domain)
         else:
             files = [
-                f for f in os.listdir(artifact_dir) if f.endswith(".taxonomy_seeds.json")
+                f
+                for f in os.listdir(artifact_dir)
+                if f.endswith(".taxonomy_seeds.json")
             ]
             print(f"[DEBUG] 找到 {len(files)} 个种子文件: {files}")
             for i, f in enumerate(files, 1):
