@@ -20,7 +20,14 @@ class ClassificationActions(BaseActions):
                 return 1
             return 0
         cur = self.obj.get("result_level") or ""
-        if rank(level) >= rank(cur):
+        # 聚合所有触发的决策规则ID
+        all_ids = self.obj.get("matched_rule_ids") or []
+        if rule_id and rule_id not in all_ids:
+            all_ids.append(rule_id)
+        self.obj["matched_rule_ids"] = all_ids
+
+        # 仅在等级严格更高时覆盖最终选择
+        if rank(level) > rank(cur):
             self.obj["result_level"] = level
             self.obj["result_rule_id"] = rule_id
 

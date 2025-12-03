@@ -61,6 +61,38 @@ def classify_rows(
         print(f"[ERROR] Failed to load rules: {e}")
         return
 
+    # 过滤无效正则的规则（空值或不可编译），避免边缘情况误命中
+    def _valid_rule(rule: Dict) -> bool:
+        cond = rule.get("conditions") or {}
+        def _iter(c):
+            if not isinstance(c, dict):
+                return []
+            items = []
+            for k in ("all", "any"):
+                arr = c.get(k) or []
+                for it in arr:
+                    if isinstance(it, dict):
+                        items.append(it)
+            return items
+        stack = [cond]
+        while stack:
+            cur = stack.pop()
+            for it in _iter(cur):
+                name = str(it.get("name", ""))
+                op = str(it.get("operator", ""))
+                val = it.get("value")
+                if name == "value_text" and op == "matches_regex":
+                    rx = str(val or "")
+                    if not rx:
+                        return False
+                    try:
+                        __import("re").compile(rx)
+                    except Exception:
+                        return False
+        return True
+
+    unified_rules = [r for r in unified_rules if _valid_rule(r)]
+
     wb = openpyxl.load_workbook(in_path)
     ws = wb[sheet_name] if sheet_name and sheet_name in wb.sheetnames else wb.active
 
@@ -138,7 +170,7 @@ def classify_rows(
             rule_list=decision_rules,
             defined_variables=vars_obj,
             defined_actions=acts_obj,
-            stop_on_first_trigger=True,
+            stop_on_first_trigger=False,
         )
 
         final_category = obj.get("category_path", "")
@@ -147,12 +179,14 @@ def classify_rows(
         audits = obj.get("audits", [])
         score = obj.get("score", 0)
         marker = obj.get("data_marker", "")
+        hits = obj.get("hits", [])
         audit_str = ";".join([json.dumps(a, ensure_ascii=False) for a in audits]) if audits else ""
+        tags_str = " ".join([str(h) for h in hits if h]) if hits else ""
 
         if final_category or level or rid:
             matched_rows += 1
 
-        processed.append({"row": r, "category": final_category, "level": level, "rid": rid, "audit": audit_str, "score": score, "marker": marker})
+        processed.append({"row": r, "category": final_category, "level": level, "rid": rid, "audit": audit_str, "score": score, "marker": marker, "tags": tags_str})
 
     max_depth = 0
     for p in processed:
@@ -161,7 +195,7 @@ def classify_rows(
             max_depth = len(parts)
 
     cat_headers = [f"{i}级分类" for i in range(1, max_depth + 1)]
-    new_headers = headers + cat_headers + ["数据标识", "分级", "规则ID", "置信度"]
+    new_headers = headers + cat_headers + ["数据标识", "分级", "规则ID", "命中标签", "置信度"]
     out_wb = openpyxl.Workbook()
     out_ws = out_wb.active
     out_ws.title = ws.title
@@ -186,7 +220,7 @@ def classify_rows(
             level = p["level"]
             rid = p["rid"]
 
-        out_ws.append([*p["row"], *cat_cols, p.get("marker", ""), level, rid, conf])
+        out_ws.append([*p["row"], *cat_cols, p.get("marker", ""), level, rid, p.get("tags", ""), conf])
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     out_wb.save(out_path)
